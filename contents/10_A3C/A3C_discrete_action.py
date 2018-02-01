@@ -52,8 +52,8 @@ N_A = env.action_space.n
 
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, sharing=NO_SHARE, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0):
-        self.sharing = sharing
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0):
+        self.hard_share = hard_share
 
         if scope == GLOBAL_NET_SCOPE:   # get global network
             with tf.variable_scope(scope):
@@ -106,7 +106,7 @@ class ACNet(object):
 
     def _build_net(self, scope):
         w_init = tf.random_normal_initializer(0., .1)
-        if self.sharing & HARD_SHARE:
+        if self.hard_share is not None:
             if False:
                 with tf.variable_scope('shared'):
                     l_s = tf.layers.dense(self.s, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
@@ -143,11 +143,11 @@ class ACNet(object):
         else:
             with tf.variable_scope('actor'):
                 l_a = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                if self.sharing & SOFT_SHARE: self.l_a = l_a
+                self.l_a = l_a
                 a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
             with tf.variable_scope('critic'):
                 l_c = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                if self.sharing & SOFT_SHARE: self.l_c = l_c
+                self.l_c = l_c
                 v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
         a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
         c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
@@ -170,11 +170,11 @@ class ACNet(object):
 
 
 class Worker(object):
-    def __init__(self, name, globalAC, sharing=NO_SHARE, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=max_ep_steps)
         self.name = name
-        self.AC = ACNet(name, globalAC, sharing=sharing, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic)
+        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic)
         self.debug = debug
         self.images = []
 
@@ -245,7 +245,7 @@ def parse_args():
     global MAX_GLOBAL_EP
 
     parser = argparse.ArgumentParser(description='Run A3C on discrete cart-pole.')
-    parser.add_argument('--hard_share', default=False, action='store_true', help='Enables hard parameter sharing.')
+    parser.add_argument('--hard_share', type=str, default='none', help="Indicates whether the models should have an equal number of parameters ('equal_params'), an equal number of hidden units ('equal_hiddens'), or no sharing ('none' -- default).")
     parser.add_argument('--soft_share', type=float, default=0.0, help='Enables soft sharing of both actor and critic parameters, via L2 loss, with the specificied weight.')
     parser.add_argument('--soft_share_actor', type=float, default=0.0, help='Enables soft sharing of actor parameters, via L2 loss, with the specificied weight.')
     parser.add_argument('--soft_share_critic', type=float, default=0.0, help='Enables soft sharing of critic parameters, via L2 loss, with the specificied weight.')
@@ -262,18 +262,17 @@ def parse_args():
     parser.add_argument('--max_ep_steps', type=int, default=2000, help='The number of time steps per episode before calling the episode done.')
     args = parser.parse_args()
 
-    sharing = 0
-    if args.hard_share:
-        sharing = sharing | HARD_SHARE
+    if args.hard_share not in ['equal_params', 'equal_hiddens', 'none']:
+        raise ValueError("Hard sharing options are 'equal_params' and 'equal_hiddens'.")
+
+    if args.hard_share == 'none':
+        args.hard_share = None
 
     soft_share_actor = args.soft_share_actor
     soft_share_critic = args.soft_share_critic
     if args.soft_share > 0:
         soft_share_actor = args.soft_share
         soft_share_critic = args.soft_share
-
-    if soft_share_actor > 0 or soft_share_critic > 0:
-        sharing = sharing | SOFT_SHARE
 
     gradient_clip_actor = args.gradient_clip_actor
     gradient_clip_critic = args.gradient_clip_critic
@@ -303,7 +302,7 @@ def parse_args():
     elif args.optimizer == 'adagrad':
         optimizer_class = tf.train.AdagradOptimizer
 
-    print("sharing: ", sharing)
+    print("hard_share: ", args.hard_share)
     print("soft_share_actor: ", soft_share_actor)
     print("soft_share_critic: ", soft_share_critic)
     print("gradient_clip_actor: ", gradient_clip_actor)
@@ -314,22 +313,22 @@ def parse_args():
     print("optimizer_class: ", optimizer_class)
     print("max_ep_steps: ", args.max_ep_steps)
 
-    return args, sharing, soft_share_actor, soft_share_critic, gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class
+    return args, soft_share_actor, soft_share_critic, gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class
 
 
 if __name__ == "__main__":
-    args, sharing, soft_share_actor, soft_share_critic,  gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class = parse_args()
+    args, soft_share_actor, soft_share_critic,  gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class = parse_args()
     SESS = tf.Session()
 
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, sharing=sharing)  # we only need its params
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, sharing=sharing, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -354,7 +353,15 @@ if __name__ == "__main__":
     plt.xlabel('step')
     plt.ylabel('Total moving reward')
     if args.log:
-        plt.savefig('plot_'+str(MAX_GLOBAL_EP)+'_sharing_'+str(sharing)+'_lra_'+str(lr_a)+'_lrc_'+str(lr_c)+'.png')
+        name = 'plot_'+str(MAX_GLOBAL_EP)+'_sharing_'
+        if args.hard_share is not None:
+            name += 'hard'
+        elif soft_sharing_coeff_actor > 0. or soft_sharing_coeff_critic > 0.:
+            name += 'soft'
+        else:
+            name += 'none'
+        name += '_lra_'+str(lr_a)+'_lrc_'+str(lr_c)+'.png'
+        plt.savefig()
     else:
         plt.show()
 
