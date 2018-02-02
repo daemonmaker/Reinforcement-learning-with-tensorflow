@@ -23,14 +23,14 @@ GAME = 'Pendulum-v0'
 OUTPUT_GRAPH = True
 LOG_DIR = './log'
 N_WORKERS = multiprocessing.cpu_count()
-MAX_EP_STEP = 200
-MAX_GLOBAL_EP = 2000
+MAX_EP_STEP = 100
+MAX_GLOBAL_EP = 10000 #2000
 GLOBAL_NET_SCOPE = 'Global_Net'
 UPDATE_GLOBAL_ITER = 10
 GAMMA = 0.9
 ENTROPY_BETA = 0.01
-LR_A = 0.0001    # learning rate for actor
-LR_C = 0.001    # learning rate for critic
+LR_A = 0.0001 # 0.0001    # learning rate for actor
+LR_C = 0.001 # 0.001    # learning rate for critic
 GLOBAL_RUNNING_R = []
 GLOBAL_EP = 0
 
@@ -58,7 +58,7 @@ class ACNet(object):
 
                 td = tf.subtract(self.v_target, self.v, name='TD_error')
                 with tf.name_scope('c_loss'):
-                    self.c_loss = tf.reduce_mean(tf.square(td))
+                    self.c_loss = tf.reduce_mean(tf.square(td)) + 0.01*tf.nn.l2_loss(self.l_a - self.l_c)
 
                 with tf.name_scope('wrap_a_out'):
                     mu, sigma = mu * A_BOUND[1], sigma + 1e-4
@@ -70,7 +70,7 @@ class ACNet(object):
                     exp_v = log_prob * tf.stop_gradient(td)
                     entropy = normal_dist.entropy()  # encourage exploration
                     self.exp_v = ENTROPY_BETA * entropy + exp_v
-                    self.a_loss = tf.reduce_mean(-self.exp_v)
+                    self.a_loss = tf.reduce_mean(-self.exp_v) #+ 0.001*tf.nn.l2_loss(self.l_a - self.l_c)
 
                 with tf.name_scope('choose_a'):  # use local params to choose action
                     self.A = tf.clip_by_value(tf.squeeze(normal_dist.sample(1), axis=0), A_BOUND[0], A_BOUND[1])
@@ -90,15 +90,35 @@ class ACNet(object):
         w_init = tf.random_normal_initializer(0., .1)
         with tf.variable_scope('actor'):
             l_a = tf.layers.dense(self.s, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
+            l_a = tf.layers.dense(l_a, 100, tf.nn.relu6, kernel_initializer=w_init, name='la2')
+            self.l_a = l_a
             mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
             sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
         with tf.variable_scope('critic'):
             l_c = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+            l_c = tf.layers.dense(l_c, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc2')
+            self.l_c = l_c
             v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
         a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
         c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
         return mu, sigma, v, a_params, c_params
-
+    '''
+    def _build_net(self, scope):
+        w_init = tf.random_normal_initializer(0., .1)
+        with tf.variable_scope('shared'):
+            l_s = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='ls')
+        with tf.variable_scope('actor'):
+            l_a = tf.layers.dense(l_s, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
+            mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
+            sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
+        with tf.variable_scope('critic'):
+            l_c = tf.layers.dense(l_s, 50, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+            v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
+        s_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/shared')
+        a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
+        c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
+        return mu, sigma, v, a_params + s_params, c_params + s_params
+    '''
     def update_global(self, feed_dict):  # run by a local
         SESS.run([self.update_a_op, self.update_c_op], feed_dict)  # local grads applies to global net
 
@@ -205,3 +225,13 @@ if __name__ == "__main__":
     plt.ylabel('Total moving reward')
     plt.show()
 
+    env = workers[0].env
+    s = env.reset()
+    tidx = 0
+    done = False
+    while tidx < 1000 and not done:
+        tidx += 1
+        a = workers[0].AC.choose_action(s)
+        env.render()
+        s_, r, done, info = env.step(a)
+        s = s_

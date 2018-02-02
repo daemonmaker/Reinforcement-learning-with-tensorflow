@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 from gym.wrappers.time_limit import TimeLimit
 import argparse
 from baselines import logger
+from skimage.color import rgb2grey
+from skimage.transform import resize
 
 
 img_lock = threading.Lock()
@@ -52,16 +54,24 @@ N_A = env.action_space.n
 
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0):
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, image_shape=None):
         self.hard_share = hard_share
+        self.image_shape = image_shape
+
+        def input_placeholder():
+            if self.image_shape is not None:
+                s = tf.placeholder(tf.float32, [None, ] + list(self.image_shape), 'S')
+            else:
+                s = tf.placeholder(tf.float32, [None, N_S], 'S')
+            return s
 
         if scope == GLOBAL_NET_SCOPE:   # get global network
             with tf.variable_scope(scope):
-                self.s = tf.placeholder(tf.float32, [None, N_S], 'S')
+                self.s = input_placeholder()
                 self.a_params, self.c_params = self._build_net(scope)[-2:]
         else:   # local net, calculate losses
             with tf.variable_scope(scope):
-                self.s = tf.placeholder(tf.float32, [None, N_S], 'S')
+                self.s = input_placeholder()
                 self.a_his = tf.placeholder(tf.int32, [None, ], 'A')
                 self.v_target = tf.placeholder(tf.float32, [None, 1], 'Vtarget')
 
@@ -106,10 +116,11 @@ class ACNet(object):
 
     def _build_net(self, scope):
         w_init = tf.random_normal_initializer(0., .1)
+        inputs = self.s
         if self.hard_share is not None:
-            if False:
+            if self.hard_share == 'equal_params':
                 with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(self.s, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
+                    l_s = tf.layers.dense(inputs, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
                 with tf.variable_scope('actor'):
                     l_a = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='la')
                     a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
@@ -118,7 +129,7 @@ class ACNet(object):
                     v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
             elif False:
                 with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='ls')
+                    l_s = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='ls')
                 with tf.variable_scope('actor'):
                     l_a = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='la')
                     a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
@@ -127,7 +138,7 @@ class ACNet(object):
                     v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
             else:
                 with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(self.s, 200, tf.nn.relu6, kernel_initializer=w_init, name='ls')
+                    l_s = tf.layers.dense(inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='ls')
                 with tf.variable_scope('actor'):
                     l_a = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='la')
                     a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
@@ -141,16 +152,35 @@ class ACNet(object):
             c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
             return a_prob, v, a_params+s_params, c_params+s_params
         else:
+            if self.image_shape is not None:
+                with tf.variable_scope('conv_inputs'):
+                    conv1 = tf.layers.conv2d(inputs, 64, 16, name='c1')
+                    #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
+                    relu1 = tf.nn.relu(conv1, name='relu1')
+                    conv2 = tf.layers.conv2d(relu1, 32, 8, name='c2')
+                    pool2 = tf.layers.max_pooling2d(conv2, 5, 1, name='p2')
+                    relu2 = tf.nn.relu(pool2, name='relu2')
+                    conv3 = tf.layers.conv2d(relu2, 16, 8, name='c3')
+                    pool3 = tf.layers.max_pooling2d(conv3, 5, 1, name='p3')
+                    relu3 = tf.nn.relu(pool3, name='relu3')
+                    conv4 = tf.layers.conv2d(relu3, 16, 8, name='c4')
+                    pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
+                    relu4 = tf.nn.relu(pool4, name='relu4')
+                    inputs = tf.layers.flatten(relu4, name='p3')
             with tf.variable_scope('actor'):
-                l_a = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
+                l_a = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
                 self.l_a = l_a
                 a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
             with tf.variable_scope('critic'):
-                l_c = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+                l_c = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
                 self.l_c = l_c
                 v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
         a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
         c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
+        if self.image_shape is not None:
+            i_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/conv_inputs')
+            a_params += i_params
+            c_params += i_params
         return a_prob, v, a_params, c_params
 
     def get_stats(self, feed_dict):
@@ -163,31 +193,62 @@ class ACNet(object):
         SESS.run([self.pull_a_params_op, self.pull_c_params_op])
 
     def choose_action(self, s):  # run by a local
-        prob_weights = SESS.run(self.a_prob, feed_dict={self.s: s[np.newaxis, :]})
+        temp = s[np.newaxis, :]
+        prob_weights = SESS.run(self.a_prob, feed_dict={self.s: temp})
         action = np.random.choice(range(prob_weights.shape[1]),
                                   p=prob_weights.ravel())  # select action w.r.t the actions prob
         return action
 
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200, image_shape=None):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=max_ep_steps)
         self.name = name
-        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic)
+        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, image_shape=image_shape)
         self.debug = debug
-        self.images = []
+        self.image_shape = image_shape
 
     def work(self):
+        def get_img(fn, *args):
+            img_lock.acquire()
+            results = fn(*args)
+            img = self.env.render(mode='rgb_array', close=False)
+            img_lock.release()
+            img = rgb2grey(img)
+            img = resize(img, self.image_shape)
+            return img, results
+
+        def env_reset_obs():
+            return self.env.reset()
+
+        def env_reset_img():
+            img, _ = get_img(env_reset_obs)
+            return img
+
+        def env_step_obs(a):
+            return self.env.step(a)
+
+        def env_step_img(a):
+            img, results = get_img(env_step_obs, a)
+            return img, results[1], results[2], results[3]
+
+        if self.image_shape is not None:
+            env_reset_fn = env_reset_img
+            env_step_fn = env_step_img
+        else:
+            env_reset_fn = env_reset_obs
+            env_step_fn = env_step_obs
+
         global GLOBAL_RUNNING_R, GLOBAL_R, GLOBAL_EP, MAX_GLOBAL_EP
         total_step = 1
         buffer_s, buffer_a, buffer_r = [], [], []
         while not COORD.should_stop() and GLOBAL_EP < MAX_GLOBAL_EP:
-            s = self.env.reset()
+            s = env_reset_fn()
             ep_r = 0
             while True:
                 a = self.AC.choose_action(s)
-                s_, r, done, info = self.env.step(a)
+                s_, r, done, info = env_step_fn(a)
                 if done: r = -5
                 ep_r += r
                 buffer_s.append(s)
@@ -205,6 +266,8 @@ class Worker(object):
                         buffer_v_target.append(v_s_)
                     buffer_v_target.reverse()
 
+                    if self.image_shape is not None:
+                        buffer_s = [np.expand_dims(buffer_s_, 0) for buffer_s_ in buffer_s]
                     buffer_s, buffer_a, buffer_v_target = np.vstack(buffer_s), np.array(buffer_a), np.vstack(buffer_v_target)
                     feed_dict = {
                         self.AC.s: buffer_s,
@@ -260,8 +323,9 @@ def parse_args():
     parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
     parser.add_argument('--log', default=False, action='store_true', help='Enables logging.')
     parser.add_argument('--max_ep_steps', type=int, default=2000, help='The number of time steps per episode before calling the episode done.')
+    parser.add_argument('--image_shape', nargs='*', default=None, help='Designates that images shoud be used in lieu of observations and what shpae to use for them.')
     args = parser.parse_args()
-
+    
     if args.hard_share not in ['equal_params', 'equal_hiddens', 'none']:
         raise ValueError("Hard sharing options are 'equal_params' and 'equal_hiddens'.")
 
@@ -302,6 +366,10 @@ def parse_args():
     elif args.optimizer == 'adagrad':
         optimizer_class = tf.train.AdagradOptimizer
 
+    image_shape = None
+    if args.image_shape is not None:
+        image_shape = tuple(map(int, args.image_shape[0].split(','))) + (1,) # Add the number of channels which will always be 1 for grey scale
+
     print("hard_share: ", args.hard_share)
     print("soft_share_actor: ", soft_share_actor)
     print("soft_share_critic: ", soft_share_critic)
@@ -312,23 +380,24 @@ def parse_args():
     print("max_global_ep: ", MAX_GLOBAL_EP)
     print("optimizer_class: ", optimizer_class)
     print("max_ep_steps: ", args.max_ep_steps)
+    print("image_shape: ", image_shape)
 
-    return args, soft_share_actor, soft_share_critic, gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class
+    return args, soft_share_actor, soft_share_critic, gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class, image_shape
 
 
 if __name__ == "__main__":
-    args, soft_share_actor, soft_share_critic,  gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class = parse_args()
+    args, soft_share_actor, soft_share_critic,  gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class, image_shape = parse_args()
     SESS = tf.Session()
 
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share)  # we only need its params
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps, image_shape=image_shape))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -337,6 +406,9 @@ if __name__ == "__main__":
         if os.path.exists(LOG_DIR):
             shutil.rmtree(LOG_DIR)
         tf.summary.FileWriter(LOG_DIR, SESS.graph)
+
+    #workers[0].work()
+    #import ipdb; ipdb.set_trace()
 
     worker_threads = []
     for worker in workers:
