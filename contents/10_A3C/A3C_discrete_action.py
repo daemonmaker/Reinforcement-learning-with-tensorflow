@@ -24,16 +24,11 @@ import argparse
 from baselines import logger
 from skimage.color import rgb2grey
 from skimage.transform import resize
+import copy
 
 
 img_lock = threading.Lock()
 log_lock = threading.Lock()
-
-NO_SHARE = 0
-HARD_SHARE = 1
-SOFT_SHARE = 2
-SOFT_SHARE_ACTOR = 4
-SOFT_SHARE_CRITIC = 8
 
 GAME = 'CartPole-v0'
 OUTPUT_GRAPH = True
@@ -41,9 +36,9 @@ LOG_DIR = './log'
 N_WORKERS = multiprocessing.cpu_count()
 MAX_GLOBAL_EP = 1000
 GLOBAL_NET_SCOPE = 'Global_Net'
-UPDATE_GLOBAL_ITER = 10
-GAMMA = 0.9
-ENTROPY_BETA = 0.001
+UPDATE_GLOBAL_ITER = 100 #10
+GAMMA = 0.999 # 0.9
+ENTROPY_BETA = 0.01 # 0.001
 GLOBAL_RUNNING_R = []
 GLOBAL_R = []
 GLOBAL_EP = 0
@@ -54,24 +49,25 @@ N_A = env.action_space.n
 
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, image_shape=None):
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, image_shape=None, stack=1):
         self.hard_share = hard_share
         self.image_shape = image_shape
+        self.stack = stack
 
-        def input_placeholder():
+        def input_placeholders():
             if self.image_shape is not None:
-                s = tf.placeholder(tf.float32, [None, ] + list(self.image_shape), 'S')
+                s = tuple([tf.placeholder(tf.float32, [None, ] + list(self.image_shape), 'S') for _ in range(self.stack)])
             else:
-                s = tf.placeholder(tf.float32, [None, N_S], 'S')
+                s = tuple([tf.placeholder(tf.float32, [None, N_S], 'S') for _ in range(self.stack)])
             return s
 
         if scope == GLOBAL_NET_SCOPE:   # get global network
             with tf.variable_scope(scope):
-                self.s = input_placeholder()
+                self.s = input_placeholders()
                 self.a_params, self.c_params = self._build_net(scope)[-2:]
         else:   # local net, calculate losses
             with tf.variable_scope(scope):
-                self.s = input_placeholder()
+                self.s = input_placeholders()
                 self.a_his = tf.placeholder(tf.int32, [None, ], 'A')
                 self.v_target = tf.placeholder(tf.float32, [None, 1], 'Vtarget')
 
@@ -118,6 +114,20 @@ class ACNet(object):
         w_init = tf.random_normal_initializer(0., .1)
         inputs = self.s
         if self.hard_share is not None:
+            if self.image_shape is not None:
+                with tf.variable_scope('conv_inputs'):
+                    if self.stack == 2:
+                        diff = inputs[1] - inputs[0]
+                        inputs = tf.concat([inputs[1], diff], -1)
+                    else:
+                        inputs = tf.concat(inputs, -1)
+                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.cos, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c1')
+                    conv2 = tf.layers.conv2d(conv1, 32, 8, strides=(3,3), padding='same', activation=tf.nn.reul, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c2')
+                    conv3 = tf.layers.conv2d(conv2, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c3')
+                    conv4 = tf.layers.conv2d(conv33, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c4')
+                    inputs = tf.layers.flatten(conv4, name='p3')
+            else:
+                inputs = tf.concat(inputs, 1)
             if self.hard_share == 'equal_params':
                 with tf.variable_scope('shared'):
                     l_s = tf.layers.dense(inputs, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
@@ -154,19 +164,36 @@ class ACNet(object):
         else:
             if self.image_shape is not None:
                 with tf.variable_scope('conv_inputs'):
-                    conv1 = tf.layers.conv2d(inputs, 64, 16, name='c1')
+                    '''
+                    if self.stack == 2:
+                        diff = inputs[1] - inputs[0]
+                        inputs = tf.concat([inputs[1], diff], -1)
+                    else:
+                        inputs = tf.concat(inputs, -1)
+                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c1')
+                    conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c2')
+                    conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c3')
+                    conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c4')
+                    inputs = tf.layers.flatten(conv4, name='p3')
+                    '''
+                    # TODO DWEBB add stack support here
+                    diff = inputs[1] - inputs[0]
+                    inputs = tf.concat([inputs[1], diff], -1)
+                    conv1 = tf.layers.conv2d(inputs, 64, 8, name='c1')
                     #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
                     relu1 = tf.nn.relu(conv1, name='relu1')
                     conv2 = tf.layers.conv2d(relu1, 32, 8, name='c2')
                     pool2 = tf.layers.max_pooling2d(conv2, 5, 1, name='p2')
                     relu2 = tf.nn.relu(pool2, name='relu2')
-                    conv3 = tf.layers.conv2d(relu2, 16, 8, name='c3')
+                    conv3 = tf.layers.conv2d(relu2, 32, 5, name='c3')
                     pool3 = tf.layers.max_pooling2d(conv3, 5, 1, name='p3')
                     relu3 = tf.nn.relu(pool3, name='relu3')
-                    conv4 = tf.layers.conv2d(relu3, 16, 8, name='c4')
+                    conv4 = tf.layers.conv2d(relu3, 32, 5, name='c4')
                     pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
                     relu4 = tf.nn.relu(pool4, name='relu4')
                     inputs = tf.layers.flatten(relu4, name='p3')
+            else:
+                inputs = tf.concat(inputs, 1)
             with tf.variable_scope('actor'):
                 l_a = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
                 self.l_a = l_a
@@ -187,33 +214,38 @@ class ACNet(object):
         return SESS.run([self.a_loss, self.c_loss, self.t_td, self.c_loss, self.t_log_prob, self.t_exp_v, self.t_entropy, self.t_exp_v2, self.a_loss, self.a_grads, self.c_grads], feed_dict)
 
     def update_global(self, feed_dict):  # run by a local
-        SESS.run([self.update_a_op, self.update_c_op], feed_dict)  # local grads applies to global net
+        a_loss, c_loss, entropy, _, _ = SESS.run([self.c_loss, self.a_loss, self.t_exp_v, self.update_a_op, self.update_c_op], feed_dict)  # local grads applies to global net
+        return a_loss, c_loss, entropy[0, 0]
 
     def pull_global(self):  # run by a local
         SESS.run([self.pull_a_params_op, self.pull_c_params_op])
 
     def choose_action(self, s):  # run by a local
-        temp = s[np.newaxis, :]
-        prob_weights = SESS.run(self.a_prob, feed_dict={self.s: temp})
+        if type(s) is not list:
+            import ipdb; ipdb.set_trace()
+        temp = [obs[np.newaxis, :] for obs in s ]
+        feed_dict = {var: obs for var, obs in zip(self.s, temp)}
+        prob_weights = SESS.run(self.a_prob, feed_dict=feed_dict)
         action = np.random.choice(range(prob_weights.shape[1]),
                                   p=prob_weights.ravel())  # select action w.r.t the actions prob
         return action
 
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200, image_shape=None):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200, image_shape=None, stack=1):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=max_ep_steps)
         self.name = name
-        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, image_shape=image_shape)
+        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, image_shape=image_shape, stack=stack)
         self.debug = debug
         self.image_shape = image_shape
+        self.stack = stack
 
     def work(self):
         def get_img(fn, *args):
             img_lock.acquire()
             results = fn(*args)
-            img = self.env.render(mode='rgb_array', close=False)
+            img = self.env.render(mode='rgb_array')
             img_lock.release()
             img = rgb2grey(img)
             img = resize(img, self.image_shape)
@@ -245,9 +277,10 @@ class Worker(object):
         buffer_s, buffer_a, buffer_r = [], [], []
         while not COORD.should_stop() and GLOBAL_EP < MAX_GLOBAL_EP:
             s = env_reset_fn()
+            buffer_s = [s]*self.stack
             ep_r = 0
             while True:
-                a = self.AC.choose_action(s)
+                a = self.AC.choose_action(buffer_s[-self.stack:])
                 s_, r, done, info = env_step_fn(a)
                 if done: r = -5
                 ep_r += r
@@ -256,10 +289,14 @@ class Worker(object):
                 buffer_r.append(r)
 
                 if total_step % UPDATE_GLOBAL_ITER == 0 or done:   # update global and assign to local net
+
                     if done:
                         v_s_ = 0   # terminal
                     else:
-                        v_s_ = SESS.run(self.AC.v, {self.AC.s: s_[np.newaxis, :]})[0, 0]
+                        obs_hist = buffer_s[-(self.stack-1):] + [s_,]
+                        feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
+                        v_s_ = SESS.run(self.AC.v, feed_dict=feed_dict)[0, 0]
+
                     buffer_v_target = []
                     for r in buffer_r[::-1]:    # reverse buffer r
                         v_s_ = r + GAMMA * v_s_
@@ -267,20 +304,23 @@ class Worker(object):
                     buffer_v_target.reverse()
 
                     if self.image_shape is not None:
-                        buffer_s = [np.expand_dims(buffer_s_, 0) for buffer_s_ in buffer_s]
-                    buffer_s, buffer_a, buffer_v_target = np.vstack(buffer_s), np.array(buffer_a), np.vstack(buffer_v_target)
-                    feed_dict = {
-                        self.AC.s: buffer_s,
-                        self.AC.a_his: buffer_a,
-                        self.AC.v_target: buffer_v_target,
-                    }
+                        buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
+                    else:
+                        buffer_s_ = copy.deepcopy(buffer_s)
+                    obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
+                    buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
+                    #import ipdb; ipdb.set_trace()
+                    feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
+                    feed_dict[self.AC.a_his] = buffer_a
+                    feed_dict[self.AC.v_target] = buffer_v_target
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
                         print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss)
-                    self.AC.update_global(feed_dict)
+                    c_loss, a_loss, entropy = self.AC.update_global(feed_dict)
 
-                    buffer_s, buffer_a, buffer_r = [], [], []
+                    #import ipdb; ipdb.set_trace()
+                    buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack):], [], []
                     self.AC.pull_global()
 
                 s = s_
@@ -297,6 +337,9 @@ class Worker(object):
                     logger.record_tabular("name", self.name)
                     logger.record_tabular("ep_r", ep_r)
                     logger.record_tabular("ep_r_weighted", GLOBAL_RUNNING_R[-1])
+                    logger.record_tabular("c_loss", c_loss)
+                    logger.record_tabular("a_loss", a_loss)
+                    logger.record_tabular("entropy", entropy)
                     logger.dump_tabular()
                     log_lock.release()
 
@@ -323,7 +366,9 @@ def parse_args():
     parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
     parser.add_argument('--log', default=False, action='store_true', help='Enables logging.')
     parser.add_argument('--max_ep_steps', type=int, default=2000, help='The number of time steps per episode before calling the episode done.')
+    parser.add_argument('--stack', type=int, default=1, help='Number of observations to use for state.')
     parser.add_argument('--image_shape', nargs='*', default=None, help='Designates that images shoud be used in lieu of observations and what shpae to use for them.')
+    parser.add_argument('--debug_worker', default=False, action='store_true')
     args = parser.parse_args()
     
     if args.hard_share not in ['equal_params', 'equal_hiddens', 'none']:
@@ -366,9 +411,14 @@ def parse_args():
     elif args.optimizer == 'adagrad':
         optimizer_class = tf.train.AdagradOptimizer
 
+    if args.stack < 1:
+        raise ValueError('Number of frames ({}) to stack must be positive.'.format(args.stack))
+
     image_shape = None
     if args.image_shape is not None:
         image_shape = tuple(map(int, args.image_shape[0].split(','))) + (1,) # Add the number of channels which will always be 1 for grey scale
+        if args.stack < 2:
+            args.stack = 2 # Automatically incorporate diffs with previous images
 
     print("hard_share: ", args.hard_share)
     print("soft_share_actor: ", soft_share_actor)
@@ -392,12 +442,12 @@ if __name__ == "__main__":
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape)  # we only need its params
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape, stack=args.stack)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps, image_shape=image_shape))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps, image_shape=image_shape, stack=args.stack))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -407,8 +457,9 @@ if __name__ == "__main__":
             shutil.rmtree(LOG_DIR)
         tf.summary.FileWriter(LOG_DIR, SESS.graph)
 
-    #workers[0].work()
-    #import ipdb; ipdb.set_trace()
+    if args.debug_worker:
+        workers[0].work()
+        exit
 
     worker_threads = []
     for worker in workers:
@@ -440,10 +491,19 @@ if __name__ == "__main__":
         env = gym.make(GAME).unwrapped
         env = TimeLimit(env, max_episode_steps=args.max_ep_steps)
         s = env.reset()
+        buffer_s = [s]*args.stack
         tidx = 0
         done = False
         while tidx < 1000 and not done:
             tidx += 1
+            if self.image_shape is not None:
+                buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
+            else:
+                buffer_s_ = copy.deepcopy(buffer_s)
+            obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
+            buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
+            feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
+    
             a = workers[0].AC.choose_action(s)
             env.render()
             s_, r, done, info = env.step(a)
