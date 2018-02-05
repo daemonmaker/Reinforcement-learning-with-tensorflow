@@ -25,6 +25,8 @@ from baselines import logger
 from skimage.color import rgb2grey
 from skimage.transform import resize
 import copy
+import sys
+from collections import deque
 
 
 img_lock = threading.Lock()
@@ -121,10 +123,10 @@ class ACNet(object):
                         inputs = tf.concat([inputs[1], diff], -1)
                     else:
                         inputs = tf.concat(inputs, -1)
-                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.cos, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c1')
-                    conv2 = tf.layers.conv2d(conv1, 32, 8, strides=(3,3), padding='same', activation=tf.nn.reul, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c2')
-                    conv3 = tf.layers.conv2d(conv2, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c3')
-                    conv4 = tf.layers.conv2d(conv33, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c4')
+                    conv1 = tf.layers.conv2d(inputs, 64, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c1')
+                    conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c2')
+                    conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c3')
+                    conv4 = tf.layers.conv2d(conv3, 16, 3, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c4')
                     inputs = tf.layers.flatten(conv4, name='p3')
             else:
                 inputs = tf.concat(inputs, 1)
@@ -164,16 +166,15 @@ class ACNet(object):
         else:
             if self.image_shape is not None:
                 with tf.variable_scope('conv_inputs'):
-                    '''
                     if self.stack == 2:
                         diff = inputs[1] - inputs[0]
                         inputs = tf.concat([inputs[1], diff], -1)
                     else:
                         inputs = tf.concat(inputs, -1)
-                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c1')
-                    conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c2')
-                    conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c3')
-                    conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c4')
+                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(5,5), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(0.1), name='c1')
+                    conv2 = tf.layers.conv2d(conv1, 64, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(0.1), name='c2')
+                    conv3 = tf.layers.conv2d(conv2, 32, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(0.1), name='c3')
+                    conv4 = tf.layers.conv2d(conv3, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(0.1), name='c4')
                     inputs = tf.layers.flatten(conv4, name='p3')
                     '''
                     # TODO DWEBB add stack support here
@@ -192,6 +193,7 @@ class ACNet(object):
                     pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
                     relu4 = tf.nn.relu(pool4, name='relu4')
                     inputs = tf.layers.flatten(relu4, name='p3')
+                    '''
             else:
                 inputs = tf.concat(inputs, 1)
             with tf.variable_scope('actor'):
@@ -309,7 +311,6 @@ class Worker(object):
                         buffer_s_ = copy.deepcopy(buffer_s)
                     obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
                     buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
-                    #import ipdb; ipdb.set_trace()
                     feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
                     feed_dict[self.AC.a_his] = buffer_a
                     feed_dict[self.AC.v_target] = buffer_v_target
@@ -459,7 +460,7 @@ if __name__ == "__main__":
 
     if args.debug_worker:
         workers[0].work()
-        exit
+        sys.exit()
 
     worker_threads = []
     for worker in workers:
@@ -495,16 +496,9 @@ if __name__ == "__main__":
         tidx = 0
         done = False
         while tidx < 1000 and not done:
-            tidx += 1
-            if self.image_shape is not None:
-                buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
-            else:
-                buffer_s_ = copy.deepcopy(buffer_s)
-            obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
-            buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
-            feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
-    
-            a = workers[0].AC.choose_action(s)
+            a = workers[0].AC.choose_action(buffer_s[-args.stack:])
             env.render()
             s_, r, done, info = env.step(a)
             s = s_
+            buffer_s.append(s)
+            tidx += 1
