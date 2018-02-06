@@ -37,8 +37,8 @@ N_WORKERS = multiprocessing.cpu_count()
 MAX_GLOBAL_EP = 1000
 GLOBAL_NET_SCOPE = 'Global_Net'
 UPDATE_GLOBAL_ITER = 100 #10
-GAMMA = 0.999 # 0.9
-ENTROPY_BETA = 0.01 # 0.001
+GAMMA = 0.99 # 0.9
+ENTROPY_BETA = 0.001 # 0.001
 GLOBAL_RUNNING_R = []
 GLOBAL_R = []
 GLOBAL_EP = 0
@@ -110,11 +110,50 @@ class ACNet(object):
                     self.update_a_op = OPT_A.apply_gradients(zip(self.a_grads, globalAC.a_params))
                     self.update_c_op = OPT_C.apply_gradients(zip(self.c_grads, globalAC.c_params))
 
+    def _build_conv(self, inputs, w_init):
+        with tf.variable_scope('conv_inputs'):
+            if self.stack == 2:
+                diff = inputs[1] - inputs[0]
+                inputs = tf.concat([inputs[1], diff], -1)
+            else:
+                inputs = tf.concat(inputs, -1)
+            
+            conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
+            pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
+            conv2 = tf.layers.conv2d(pool1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
+            pool2 = tf.layers.max_pooling2d(conv2, 3, 1, name='p2')
+            conv3 = tf.layers.conv2d(pool2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
+            pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
+            conv4 = tf.layers.conv2d(pool3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
+            inputs = tf.layers.flatten(conv4, name='p3')
+            inputs = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
+            '''
+            # TODO DWEBB add stack support here
+            diff = inputs[1] - inputs[0]
+            inputs = tf.concat([inputs[1], diff], -1)
+            conv1 = tf.layers.conv2d(inputs, 64, 8, name='c1')
+            #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
+            relu1 = tf.nn.relu(conv1, name='relu1')
+            conv2 = tf.layers.conv2d(relu1, 32, 8, name='c2')
+            pool2 = tf.layers.max_pooling2d(conv2, 5, 1, name='p2')
+            relu2 = tf.nn.relu(pool2, name='relu2')
+            conv3 = tf.layers.conv2d(relu2, 32, 5, name='c3')
+            pool3 = tf.layers.max_pooling2d(conv3, 5, 1, name='p3')
+            relu3 = tf.nn.relu(pool3, name='relu3')
+            conv4 = tf.layers.conv2d(relu3, 32, 5, name='c4')
+            pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
+            relu4 = tf.nn.relu(pool4, name='relu4')
+            inputs = tf.layers.flatten(relu4, name='p3')
+            '''
+            return inputs
+
     def _build_net(self, scope):
         w_init = tf.random_normal_initializer(0., .1)
         inputs = self.s
         if self.hard_share is not None:
             if self.image_shape is not None:
+                inputs = self._build_conv(inputs, w_init)
+                '''
                 with tf.variable_scope('conv_inputs'):
                     if self.stack == 2:
                         diff = inputs[1] - inputs[0]
@@ -126,6 +165,7 @@ class ACNet(object):
                     conv3 = tf.layers.conv2d(conv2, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c3')
                     conv4 = tf.layers.conv2d(conv33, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c4')
                     inputs = tf.layers.flatten(conv4, name='p3')
+                '''
             else:
                 inputs = tf.concat(inputs, 1)
             if self.hard_share == 'equal_params':
@@ -163,8 +203,9 @@ class ACNet(object):
             return a_prob, v, a_params+s_params, c_params+s_params
         else:
             if self.image_shape is not None:
-                with tf.variable_scope('conv_inputs'):
-                    '''
+                inputs = self._build_conv(inputs, w_init)
+                #with tf.variable_scope('conv_inputs'):
+                '''
                     if self.stack == 2:
                         diff = inputs[1] - inputs[0]
                         inputs = tf.concat([inputs[1], diff], -1)
@@ -175,7 +216,8 @@ class ACNet(object):
                     conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c3')
                     conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c4')
                     inputs = tf.layers.flatten(conv4, name='p3')
-                    '''
+                '''
+                '''
                     # TODO DWEBB add stack support here
                     diff = inputs[1] - inputs[0]
                     inputs = tf.concat([inputs[1], diff], -1)
@@ -192,6 +234,7 @@ class ACNet(object):
                     pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
                     relu4 = tf.nn.relu(pool4, name='relu4')
                     inputs = tf.layers.flatten(relu4, name='p3')
+                '''
             else:
                 inputs = tf.concat(inputs, 1)
             with tf.variable_scope('actor'):
@@ -276,15 +319,29 @@ class Worker(object):
         total_step = 1
         buffer_s, buffer_a, buffer_r = [], [], []
         while not COORD.should_stop() and GLOBAL_EP < MAX_GLOBAL_EP:
+            reset = 2
             s = env_reset_fn()
-            buffer_s = [s]*self.stack
+
+            #buffer_s = [s]*self.stack
+            buffer_s = [s]*(self.stack-1)# + [s,]
+            #buffer_s = [s]*(self.stack-2) + [s,]
+            '''
+            if self.stack > 1:
+                buffer_s = [s]*(self.stack-1)
+            else:
+                buffer_s = [s]
+            '''
             ep_r = 0
             while True:
+                #a = self.AC.choose_action(buffer_s[-self.stack:])
+                #import ipdb; ipdb.set_trace()
+                buffer_s.append(s)
+                #a = self.AC.choose_action(buffer_s[-(self.stack+1):-1])
                 a = self.AC.choose_action(buffer_s[-self.stack:])
                 s_, r, done, info = env_step_fn(a)
                 if done: r = -5
                 ep_r += r
-                buffer_s.append(s)
+                #buffer_s.append(s)
                 buffer_a.append(a)
                 buffer_r.append(r)
 
@@ -293,7 +350,8 @@ class Worker(object):
                     if done:
                         v_s_ = 0   # terminal
                     else:
-                        obs_hist = buffer_s[-(self.stack-1):] + [s_,]
+                        #obs_hist = buffer_s[-(self.stack-1):] + [s_,]
+                        obs_hist = buffer_s[-(self.stack):]
                         feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
                         v_s_ = SESS.run(self.AC.v, feed_dict=feed_dict)[0, 0]
 
@@ -304,15 +362,29 @@ class Worker(object):
                     buffer_v_target.reverse()
 
                     if self.image_shape is not None:
-                        buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
+                        buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s] #+ [s_[np.newaxis, :],]
                     else:
-                        buffer_s_ = copy.deepcopy(buffer_s)
-                    obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
-                    buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
+                        buffer_s_ = copy.deepcopy(buffer_s) #+ [s_,]
+                    #obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
                     #import ipdb; ipdb.set_trace()
+                    buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
+
+                    obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-(idx+1))]) for idx in range(self.stack-1)]
+                    obs_columns.append(np.vstack(buffer_s_[self.stack-1:]))
+                    '''
+                    for idx in range(self.stack):
+                        print(obs_columns[idx].shape)
+                        print(obs_columns[idx])
+                    print(np.vstack(buffer_s_).shape)
+                    print(np.vstack(buffer_s_))
+                    print(len(buffer_a))
+
+                    import ipdb; ipdb.set_trace()
+                    '''
                     feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
                     feed_dict[self.AC.a_his] = buffer_a
                     feed_dict[self.AC.v_target] = buffer_v_target
+                    #import ipdb; ipdb.set_trace()
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
@@ -320,7 +392,8 @@ class Worker(object):
                     c_loss, a_loss, entropy = self.AC.update_global(feed_dict)
 
                     #import ipdb; ipdb.set_trace()
-                    buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack):], [], []
+                    #buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack):], [], []
+                    buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack-1):], [], []
                     self.AC.pull_global()
 
                 s = s_
@@ -491,20 +564,14 @@ if __name__ == "__main__":
         env = gym.make(GAME).unwrapped
         env = TimeLimit(env, max_episode_steps=args.max_ep_steps)
         s = env.reset()
-        buffer_s = [s]*args.stack
+        env.render()
+        buffer_s = [s]*(args.stack-1)
         tidx = 0
         done = False
         while tidx < 1000 and not done:
-            tidx += 1
-            if self.image_shape is not None:
-                buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
-            else:
-                buffer_s_ = copy.deepcopy(buffer_s)
-            obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
-            buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
-            feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
-    
-            a = workers[0].AC.choose_action(s)
-            env.render()
+            buffer_s.append(s)
+            a = workers[0].AC.choose_action(buffer_s)
             s_, r, done, info = env.step(a)
+            env.render()
             s = s_
+            tidx += 1
