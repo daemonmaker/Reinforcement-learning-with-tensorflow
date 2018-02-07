@@ -8,6 +8,12 @@ View more on my tutorial page: https://morvanzhou.github.io/tutorials/
 Using:
 tensorflow 1.0
 gym 0.8.0
+
+TODO
+- Add reconstructions
+- Add cos activation
+- Add forward predictions
+- Add averaging every X steps
 """
 
 import multiprocessing
@@ -49,10 +55,11 @@ N_A = env.action_space.n
 
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, image_shape=None, stack=1):
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, soft_sharing_coeff_reconstruct=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, gradient_clip_reconstruct=1.0, image_shape=None, stack=1, reconstruct=False):
         self.hard_share = hard_share
         self.image_shape = image_shape
         self.stack = stack
+        self.reconstruct = reconstruct
 
         def input_placeholders():
             if self.image_shape is not None:
@@ -64,14 +71,14 @@ class ACNet(object):
         if scope == GLOBAL_NET_SCOPE:   # get global network
             with tf.variable_scope(scope):
                 self.s = input_placeholders()
-                self.a_params, self.c_params = self._build_net(scope)[-2:]
+                self.a_params, self.c_params, self.r_params = self._build_net(scope)[-3:]
         else:   # local net, calculate losses
             with tf.variable_scope(scope):
                 self.s = input_placeholders()
                 self.a_his = tf.placeholder(tf.int32, [None, ], 'A')
                 self.v_target = tf.placeholder(tf.float32, [None, 1], 'Vtarget')
 
-                self.a_prob, self.v, self.a_params, self.c_params = self._build_net(scope)
+                self.a_prob, self.v, self.reconstruction, self.a_params, self.c_params, self.r_params = self._build_net(scope)
 
                 td = tf.subtract(self.v_target, self.v, name='TD_error')
                 self.t_td = td
@@ -94,39 +101,57 @@ class ACNet(object):
                     if soft_sharing_coeff_critic > 0:
                         self.a_loss += soft_sharing_coeff_actor*tf.nn.l2_loss(self.l_a - self.l_c)
 
+                if self.reconstruct:
+                    with tf.name_scope('reconstruction_loss'):
+                        self.r_loss = tf.reduce_mean(tf.losses.mean_squared_error(self.s[-1], self.reconstruction))
+                        if soft_sharing_coeff_reconstruct > 0:
+                            self.r_loss += soft_sharing_coeff_reconstruct*tf.nn.l2_loss(self.l_a - self.l_r)
+                            self.r_loss += soft_sharing_coeff_reconstruct*tf.nn.l2_loss(self.l_c - self.l_r)
+
                 with tf.name_scope('local_grad'):
-                    self.a_grads, _ = tf.clip_by_global_norm(tf.gradients(self.a_loss, self.a_params), gradient_clip_actor)
+                    self.a_grads = tf.gradients(self.a_loss, self.a_params)
                     if gradient_clip_actor > 0:
                         self.a_grads, _ = tf.clip_by_global_norm(self.a_grads, gradient_clip_actor)
-                    self.c_grads, _ = tf.clip_by_global_norm(tf.gradients(self.c_loss, self.c_params), gradient_clip_critic)
+                    self.c_grads = tf.gradients(self.c_loss, self.c_params)
                     if gradient_clip_critic > 0:
                         self.c_grads, _ = tf.clip_by_global_norm(self.c_grads, gradient_clip_critic)
+                    if self.reconstruct:
+                        self.r_grads = tf.gradients(self.r_loss, self.r_params)
+                        if gradient_clip_reconstruct > 0:
+                            self.r_grads, _ = tf.clip_by_global_norm(self.r_grads, gradient_clip_reconstruct)
 
             with tf.name_scope('sync'):
                 with tf.name_scope('pull'):
                     self.pull_a_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.a_params, globalAC.a_params)]
                     self.pull_c_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.c_params, globalAC.c_params)]
+                    if self.reconstruct:
+                        self.pull_r_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.r_params, globalAC.r_params)]
                 with tf.name_scope('push'):
                     self.update_a_op = OPT_A.apply_gradients(zip(self.a_grads, globalAC.a_params))
                     self.update_c_op = OPT_C.apply_gradients(zip(self.c_grads, globalAC.c_params))
+                    if self.reconstruct:
+                        self.update_r_op = OPT_R.apply_gradients(zip(self.r_grads, globalAC.r_params))
 
     def _build_conv(self, inputs, w_init):
-        with tf.variable_scope('conv_inputs'):
+        with tf.variable_scope('convs'):
+            '''
             if self.stack == 2:
                 diff = inputs[1] - inputs[0]
                 inputs = tf.concat([inputs[1], diff], -1)
             else:
                 inputs = tf.concat(inputs, -1)
+            '''
+            inputs = tf.concat(inputs, -1)
             
             conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
-            pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
-            conv2 = tf.layers.conv2d(pool1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
-            pool2 = tf.layers.max_pooling2d(conv2, 3, 1, name='p2')
-            conv3 = tf.layers.conv2d(pool2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
-            pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
-            conv4 = tf.layers.conv2d(pool3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
-            inputs = tf.layers.flatten(conv4, name='p3')
-            inputs = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
+            #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
+            conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
+            #pool2 = tf.layers.max_pooling2d(conv2, 3, 1, name='p2')
+            conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
+            #pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
+            #conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
+            self.flattened_conv = tf.layers.flatten(conv3, name='flattened_conv')
+            inputs = tf.layers.dense(self.flattened_conv, 100, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
             '''
             # TODO DWEBB add stack support here
             diff = inputs[1] - inputs[0]
@@ -145,27 +170,27 @@ class ACNet(object):
             relu4 = tf.nn.relu(pool4, name='relu4')
             inputs = tf.layers.flatten(relu4, name='p3')
             '''
-            return inputs
+        return inputs
+
+    def _build_deconv(self, inputs, w_init):
+        with tf.variable_scope('deconvs'):
+            temp = tf.layers.dense(inputs, 400, name='temp')
+            inputs = tf.reshape(temp, [-1, 5, 5, 16], name='reshaped_flat')
+            deconv1 = tf.layers.conv2d_transpose(inputs, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='d1')
+            deconv2 = tf.layers.conv2d_transpose(deconv1, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='d2')
+            deconv3 = tf.layers.conv2d_transpose(deconv2, 32, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='d3')
+            inputs = tf.layers.conv2d_transpose(deconv3, 1, 8, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='d4')
+            #inputs = deconv2
+        return inputs
 
     def _build_net(self, scope):
         w_init = tf.random_normal_initializer(0., .1)
         inputs = self.s
+        s_params = []
+        reconstruct = ''
         if self.hard_share is not None:
             if self.image_shape is not None:
                 inputs = self._build_conv(inputs, w_init)
-                '''
-                with tf.variable_scope('conv_inputs'):
-                    if self.stack == 2:
-                        diff = inputs[1] - inputs[0]
-                        inputs = tf.concat([inputs[1], diff], -1)
-                    else:
-                        inputs = tf.concat(inputs, -1)
-                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.cos, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c1')
-                    conv2 = tf.layers.conv2d(conv1, 32, 8, strides=(3,3), padding='same', activation=tf.nn.reul, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c2')
-                    conv3 = tf.layers.conv2d(conv2, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c3')
-                    conv4 = tf.layers.conv2d(conv33, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant(1.0), name='c4')
-                    inputs = tf.layers.flatten(conv4, name='p3')
-                '''
             else:
                 inputs = tf.concat(inputs, 1)
             if self.hard_share == 'equal_params':
@@ -177,6 +202,13 @@ class ACNet(object):
                 with tf.variable_scope('critic'):
                     l_c = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lc')
                     v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
+                if self.reconstruct:
+                    with tf.variable_scope('reconstruct'):
+                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                        if self.image_shape is not None:
+                            reconstruct = self._build_deconv(l_r, w_init)
+                        else:
+                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
             elif False:
                 with tf.variable_scope('shared'):
                     l_s = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='ls')
@@ -186,6 +218,13 @@ class ACNet(object):
                 with tf.variable_scope('critic'):
                     l_c = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='lc')
                     v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
+                if self.reconstruct:
+                    with tf.variable_scope('reconstruct'):
+                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                        if self.image_shape is not None:
+                            reconstruct = self._build_deconv(l_r, w_init)
+                        else:
+                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
             else:
                 with tf.variable_scope('shared'):
                     l_s = tf.layers.dense(inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='ls')
@@ -195,46 +234,18 @@ class ACNet(object):
                 with tf.variable_scope('critic'):
                     l_c = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='lc')
                     v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
-
+                if self.reconstruct:
+                    with tf.variable_scope('reconstruct'):
+                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                        if self.image_shape is not None:
+                            reconstruct = self._build_deconv(l_r, w_init)
+                        else:
+                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
 
             s_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/shared')
-            a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
-            c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
-            return a_prob, v, a_params+s_params, c_params+s_params
         else:
             if self.image_shape is not None:
                 inputs = self._build_conv(inputs, w_init)
-                #with tf.variable_scope('conv_inputs'):
-                '''
-                    if self.stack == 2:
-                        diff = inputs[1] - inputs[0]
-                        inputs = tf.concat([inputs[1], diff], -1)
-                    else:
-                        inputs = tf.concat(inputs, -1)
-                    conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c1')
-                    conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c2')
-                    conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c3')
-                    conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=tf.truncated_normal_initializer(), bias_initializer=tf.constant_initializer(1.0), name='c4')
-                    inputs = tf.layers.flatten(conv4, name='p3')
-                '''
-                '''
-                    # TODO DWEBB add stack support here
-                    diff = inputs[1] - inputs[0]
-                    inputs = tf.concat([inputs[1], diff], -1)
-                    conv1 = tf.layers.conv2d(inputs, 64, 8, name='c1')
-                    #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
-                    relu1 = tf.nn.relu(conv1, name='relu1')
-                    conv2 = tf.layers.conv2d(relu1, 32, 8, name='c2')
-                    pool2 = tf.layers.max_pooling2d(conv2, 5, 1, name='p2')
-                    relu2 = tf.nn.relu(pool2, name='relu2')
-                    conv3 = tf.layers.conv2d(relu2, 32, 5, name='c3')
-                    pool3 = tf.layers.max_pooling2d(conv3, 5, 1, name='p3')
-                    relu3 = tf.nn.relu(pool3, name='relu3')
-                    conv4 = tf.layers.conv2d(relu3, 32, 5, name='c4')
-                    pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
-                    relu4 = tf.nn.relu(pool4, name='relu4')
-                    inputs = tf.layers.flatten(relu4, name='p3')
-                '''
             else:
                 inputs = tf.concat(inputs, 1)
             with tf.variable_scope('actor'):
@@ -245,23 +256,49 @@ class ACNet(object):
                 l_c = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
                 self.l_c = l_c
                 v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
+            if self.reconstruct:
+                with tf.variable_scope('reconstruct'):
+                    l_r = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                    self.l_r = l_r
+                    if self.image_shape is not None:
+                        reconstruct = self._build_deconv(l_r, w_init)
+                    else:
+                        reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')
+
         a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
         c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
         if self.image_shape is not None:
-            i_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/conv_inputs')
-            a_params += i_params
-            c_params += i_params
-        return a_prob, v, a_params, c_params
+            i_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/convs')
+            i_params += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/deconvs')
+        else:
+            i_params = []
+        if self.reconstruct:
+            r_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct')
+        else:
+            r_params = []
+        return a_prob, v, reconstruct, a_params + s_params + i_params, c_params + s_params + i_params, r_params + s_params + i_params
 
     def get_stats(self, feed_dict):
         return SESS.run([self.a_loss, self.c_loss, self.t_td, self.c_loss, self.t_log_prob, self.t_exp_v, self.t_entropy, self.t_exp_v2, self.a_loss, self.a_grads, self.c_grads], feed_dict)
 
     def update_global(self, feed_dict):  # run by a local
-        a_loss, c_loss, entropy, _, _ = SESS.run([self.c_loss, self.a_loss, self.t_exp_v, self.update_a_op, self.update_c_op], feed_dict)  # local grads applies to global net
-        return a_loss, c_loss, entropy[0, 0]
+        ops = [self.c_loss, self.a_loss, self.t_exp_v, self.update_a_op, self.update_c_op]
+        if self.reconstruct:
+            ops.append(self.r_loss)
+            ops.append(self.update_r_op)
+        results = SESS.run(ops, feed_dict)  # local grads applies to global net
+        a_loss, c_loss, entropy = results[:3]
+        if self.reconstruct:
+            r_loss = results[5]
+        else:
+            r_loss = 0
+        return a_loss, c_loss, r_loss, entropy[0, 0]
 
     def pull_global(self):  # run by a local
-        SESS.run([self.pull_a_params_op, self.pull_c_params_op])
+        ops = [self.pull_a_params_op, self.pull_c_params_op]
+        if self.reconstruct:
+            ops.append(self.pull_r_params_op)
+        SESS.run(ops)
 
     def choose_action(self, s):  # run by a local
         if type(s) is not list:
@@ -275,14 +312,15 @@ class ACNet(object):
 
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, debug=False, max_ep_steps=200, image_shape=None, stack=1):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, debug=False, max_ep_steps=200, image_shape=None, stack=1, reconstruct=False):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=max_ep_steps)
         self.name = name
-        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, image_shape=image_shape, stack=stack)
+        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, soft_sharing_coeff_reconstruct=soft_sharing_coeff_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, image_shape=image_shape, stack=stack, reconstruct=reconstruct)
         self.debug = debug
         self.image_shape = image_shape
         self.stack = stack
+        self.reconstruct = reconstruct
 
     def work(self):
         def get_img(fn, *args):
@@ -322,26 +360,14 @@ class Worker(object):
             reset = 2
             s = env_reset_fn()
 
-            #buffer_s = [s]*self.stack
-            buffer_s = [s]*(self.stack-1)# + [s,]
-            #buffer_s = [s]*(self.stack-2) + [s,]
-            '''
-            if self.stack > 1:
-                buffer_s = [s]*(self.stack-1)
-            else:
-                buffer_s = [s]
-            '''
+            buffer_s = [s]*(self.stack-1)
             ep_r = 0
             while True:
-                #a = self.AC.choose_action(buffer_s[-self.stack:])
-                #import ipdb; ipdb.set_trace()
                 buffer_s.append(s)
-                #a = self.AC.choose_action(buffer_s[-(self.stack+1):-1])
                 a = self.AC.choose_action(buffer_s[-self.stack:])
                 s_, r, done, info = env_step_fn(a)
                 if done: r = -5
                 ep_r += r
-                #buffer_s.append(s)
                 buffer_a.append(a)
                 buffer_r.append(r)
 
@@ -350,7 +376,6 @@ class Worker(object):
                     if done:
                         v_s_ = 0   # terminal
                     else:
-                        #obs_hist = buffer_s[-(self.stack-1):] + [s_,]
                         obs_hist = buffer_s[-(self.stack):]
                         feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
                         v_s_ = SESS.run(self.AC.v, feed_dict=feed_dict)[0, 0]
@@ -365,8 +390,6 @@ class Worker(object):
                         buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s] #+ [s_[np.newaxis, :],]
                     else:
                         buffer_s_ = copy.deepcopy(buffer_s) #+ [s_,]
-                    #obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-idx)]) for idx in range(self.stack)]
-                    #import ipdb; ipdb.set_trace()
                     buffer_a, buffer_v_target = np.array(buffer_a), np.vstack(buffer_v_target)
 
                     obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-(idx+1))]) for idx in range(self.stack-1)]
@@ -384,15 +407,12 @@ class Worker(object):
                     feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
                     feed_dict[self.AC.a_his] = buffer_a
                     feed_dict[self.AC.v_target] = buffer_v_target
-                    #import ipdb; ipdb.set_trace()
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
                         print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss)
-                    c_loss, a_loss, entropy = self.AC.update_global(feed_dict)
+                    c_loss, a_loss, r_loss, entropy = self.AC.update_global(feed_dict)
 
-                    #import ipdb; ipdb.set_trace()
-                    #buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack):], [], []
                     buffer_s, buffer_a, buffer_r = buffer_s[-(self.stack-1):], [], []
                     self.AC.pull_global()
 
@@ -412,6 +432,8 @@ class Worker(object):
                     logger.record_tabular("ep_r_weighted", GLOBAL_RUNNING_R[-1])
                     logger.record_tabular("c_loss", c_loss)
                     logger.record_tabular("a_loss", a_loss)
+                    if self.reconstruct:
+                        logger.record_tabular("r_loss", r_loss)
                     logger.record_tabular("entropy", entropy)
                     logger.dump_tabular()
                     log_lock.release()
@@ -428,20 +450,24 @@ def parse_args():
     parser.add_argument('--soft_share', type=float, default=0.0, help='Enables soft sharing of both actor and critic parameters, via L2 loss, with the specificied weight.')
     parser.add_argument('--soft_share_actor', type=float, default=0.0, help='Enables soft sharing of actor parameters, via L2 loss, with the specificied weight.')
     parser.add_argument('--soft_share_critic', type=float, default=0.0, help='Enables soft sharing of critic parameters, via L2 loss, with the specificied weight.')
+    parser.add_argument('--soft_share_reconstruct', type=float, default=0.0, help='Enables soft sharing of reconstruction parameters, via L2 loss, with the specificied weight.')
     parser.add_argument('--gradient_clip', type=float, default=0.0, help='Enables gradient clipping of actor and critic parameters with the specificied maximum gradient.')
     parser.add_argument('--gradient_clip_actor', type=float, default=0.0, help='Enables gradient clipping of actor parameters with the specificied maximum gradient.')
     parser.add_argument('--gradient_clip_critic', type=float, default=0.0, help='Enables gradient clipping of critic parameters with the specificied maximum gradient.')
+    parser.add_argument('--gradient_clip_reconstruct', type=float, default=0.0, help='Enables gradient clipping of reconstruction parameters with the specificied maximum gradient.')
     parser.add_argument('--debug', default=False, action='store_true', help='Enables debugging output.')
     parser.add_argument('--optimizer', default='adagrad', help='Which optimizer to use: rmsprop, adam, adagrad.')
     parser.add_argument('--lr', type=float, default=0.0, help='Sets the learning rate of the actor and critic.')
     parser.add_argument('--lr_a', type=float, default=0.001, help='Sets the learning rate of the actor.')
     parser.add_argument('--lr_c', type=float, default=0.001, help='Sets the learning rate of the critic.')
+    parser.add_argument('--lr_r', type=float, default=0.001, help='Sets the learning rate of the reconstruction.')
     parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
     parser.add_argument('--log', default=False, action='store_true', help='Enables logging.')
     parser.add_argument('--max_ep_steps', type=int, default=2000, help='The number of time steps per episode before calling the episode done.')
     parser.add_argument('--stack', type=int, default=1, help='Number of observations to use for state.')
     parser.add_argument('--image_shape', nargs='*', default=None, help='Designates that images shoud be used in lieu of observations and what shpae to use for them.')
     parser.add_argument('--debug_worker', default=False, action='store_true')
+    parser.add_argument('--reconstruct', default=False, action='store_true', help='Enables observation reconstruction as an additional learning signal.')
     args = parser.parse_args()
     
     if args.hard_share not in ['equal_params', 'equal_hiddens', 'none']:
@@ -452,21 +478,27 @@ def parse_args():
 
     soft_share_actor = args.soft_share_actor
     soft_share_critic = args.soft_share_critic
+    soft_share_reconstruct = args.soft_share_reconstruct
     if args.soft_share > 0:
         soft_share_actor = args.soft_share
         soft_share_critic = args.soft_share
+        soft_share_reconstruct = args.soft_share
 
     gradient_clip_actor = args.gradient_clip_actor
     gradient_clip_critic = args.gradient_clip_critic
+    gradient_clip_reconstruct = args.gradient_clip_reconstruct
     if args.gradient_clip > 0:
         gradient_clip_actor = args.gradient_clip
         gradient_clip_critic = args.gradient_clip
+        gradient_clip_reconstruct = args.gradient_clip
 
     lr_a = args.lr_a
     lr_c = args.lr_c
+    lr_r = args.lr_r
     if args.lr > 0:
         lr_a = args.lr
         lr_c = args.lr
+        lr_r = args.lr
 
     MAX_GLOBAL_EP = args.max_global_ep
 
@@ -498,29 +530,34 @@ def parse_args():
     print("soft_share_critic: ", soft_share_critic)
     print("gradient_clip_actor: ", gradient_clip_actor)
     print("gradient_clip_critic: ", gradient_clip_critic)
+    print("gradient_clip_reconstruct: ", gradient_clip_reconstruct)
+    print("gradient_clip_reconstruct: ", gradient_clip_reconstruct)
     print("learning rate, actor: ", lr_a)
     print("learning rate, critic: ", lr_c)
+    print("learning rate, reconstruct: ", lr_r)
     print("max_global_ep: ", MAX_GLOBAL_EP)
     print("optimizer_class: ", optimizer_class)
     print("max_ep_steps: ", args.max_ep_steps)
     print("image_shape: ", image_shape)
+    print("reconstruct: ", args.reconstruct)
 
-    return args, soft_share_actor, soft_share_critic, gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class, image_shape
+    return args, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class, image_shape
 
 
 if __name__ == "__main__":
-    args, soft_share_actor, soft_share_critic,  gradient_clip_actor, gradient_clip_critic, lr_a, lr_c, optimizer_class, image_shape = parse_args()
+    args, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class, image_shape = parse_args()
     SESS = tf.Session()
 
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape, stack=args.stack)  # we only need its params
+        OPT_R = optimizer_class(lr_r, name='reconstruct_opt')
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape, stack=args.stack, reconstruct=args.reconstruct)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, debug=args.debug, max_ep_steps=args.max_ep_steps, image_shape=image_shape, stack=args.stack))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, max_ep_steps=args.max_ep_steps, image_shape=image_shape, stack=args.stack, reconstruct=args.reconstruct))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -563,15 +600,23 @@ if __name__ == "__main__":
 
         env = gym.make(GAME).unwrapped
         env = TimeLimit(env, max_episode_steps=args.max_ep_steps)
-        s = env.reset()
-        env.render()
-        buffer_s = [s]*(args.stack-1)
-        tidx = 0
-        done = False
-        while tidx < 1000 and not done:
-            buffer_s.append(s)
-            a = workers[0].AC.choose_action(buffer_s)
-            s_, r, done, info = env.step(a)
+        for idx in range(10):
+            s = env.reset()
+            if image_shape is not None:
+                img = env.render(mode='rgb_array')
+                img = rgb2grey(img)
+                s = resize(img, image_shape)
             env.render()
-            s = s_
-            tidx += 1
+            buffer_s = [s]*(args.stack-1)
+            tidx = 0
+            ep_r = 0
+            done = False
+            while tidx < 1000 and not done:
+                buffer_s.append(s)
+                a = workers[0].AC.choose_action(buffer_s)
+                s_, r, done, info = env.step(a)
+                ep_r += r
+                env.render()
+                s = s_
+                tidx += 1
+            print('ep_r: ', ep_r)
