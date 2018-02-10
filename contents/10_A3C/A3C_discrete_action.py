@@ -43,7 +43,7 @@ N_WORKERS = multiprocessing.cpu_count()
 MAX_EP_STEPS = 1000
 MAX_GLOBAL_EP = 1000
 GLOBAL_NET_SCOPE = 'Global_Net'
-UPDATE_GLOBAL_ITER = 10 #100 #10
+UPDATE_GLOBAL_ITER = 1000 #10
 GAMMA = 0.9 #0.99 # 0.9
 ENTROPY_BETA = 0.001 # 0.001
 GLOBAL_RUNNING_R = []
@@ -109,15 +109,18 @@ class ACNet(object):
 
                     exp_v = log_prob * tf.stop_gradient(td)
 
+                    entropy_beta = ENTROPY_BETA
                     if CONTINUOUS:
                         entropy = normal_dist.entropy()  # encourage exploration
+                        entropy_beta = np.abs(np.random.randn(1))*ENTROPY_BETA
                     else:
                         entropy = -tf.reduce_sum(self.a_prob * tf.log(self.a_prob + 1e-5),
                                                  axis=1, keep_dims=True)  # encourage exploration
+                    print('entropy_beta: ', entropy_beta)
                     self.t_log_prob = log_prob
                     self.t_entropy = entropy
                     self.t_exp_v = exp_v
-                    self.exp_v = ENTROPY_BETA * entropy + exp_v
+                    self.exp_v = entropy_beta * entropy + exp_v
                     self.t_exp_v2 = self.exp_v
                     self.a_loss = tf.reduce_mean(-self.exp_v)
                     if soft_sharing_coeff_critic > 0:
@@ -158,25 +161,25 @@ class ACNet(object):
                     if self.reconstruct:
                         self.update_r_op = OPT_R.apply_gradients(zip(self.r_grads, globalAC.r_params))
 
+    def _batch_normalize(self, inputs):
+        return tf.layers.batch_normalization(inputs)
+
     def _build_conv(self, inputs, w_init):
         with tf.variable_scope('convs'):
-            '''
             if self.stack == 2:
                 diff = inputs[1] - inputs[0]
                 inputs = tf.concat([inputs[1], diff], -1)
             else:
                 inputs = tf.concat(inputs, -1)
-            '''
-            inputs = tf.concat(inputs, -1)
-            
-            conv1 = tf.layers.conv2d(inputs, 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
+
+            conv1 = tf.layers.conv2d(self._batch_normalize(inputs), 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
             #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
-            conv2 = tf.layers.conv2d(conv1, 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
+            conv2 = tf.layers.conv2d(self._batch_normalize(conv1), 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
             #pool2 = tf.layers.max_pooling2d(conv2, 3, 1, name='p2')
-            conv3 = tf.layers.conv2d(conv2, 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
+            conv3 = tf.layers.conv2d(self._batch_normalize(conv2), 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
             #pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
             #conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
-            self.flattened_conv = tf.layers.flatten(conv3, name='flattened_conv')
+            self.flattened_conv = tf.layers.flatten(self._batch_normalize(conv3), name='flattened_conv')
             inputs = tf.layers.dense(self.flattened_conv, 100, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
             '''
             # TODO DWEBB add stack support here
@@ -285,12 +288,13 @@ class ACNet(object):
 
             s_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/shared')
         else:
-            if self.image_shape is not None:
-                inputs = self._build_conv(inputs, w_init)
-            else:
-                inputs = tf.concat(inputs, 1)
             with tf.variable_scope('actor'):
-                l_a = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='la')
+                if self.image_shape is not None:
+                    conv_inputs = self._build_conv(inputs, w_init)
+                else:
+                    conv_inputs = tf.concat(inputs, 1)
+                l_a = tf.layers.dense(conv_inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
+                l_a = tf.layers.dense(l_a, 100, tf.nn.relu6, kernel_initializer=w_init, name='la1')
                 self.l_a = l_a
                 if CONTINUOUS:
                     mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
@@ -299,12 +303,22 @@ class ACNet(object):
                 else:
                     a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
             with tf.variable_scope('critic'):
-                l_c = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+                if self.image_shape is not None:
+                    conv_inputs = self._build_conv(inputs, w_init)
+                else:
+                    conv_inputs = tf.concat(inputs, 1)
+                l_c = tf.layers.dense(conv_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+                l_c = tf.layers.dense(l_c, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc1')
                 self.l_c = l_c
                 v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
             if self.reconstruct:
                 with tf.variable_scope('reconstruct'):
-                    l_r = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                    if self.image_shape is not None:
+                        conv_inputs = self._build_conv(inputs, w_init)
+                    else:
+                        conv_inputs = tf.concat(inputs, 1)
+                    l_r = tf.layers.dense(conv_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                    l_r = tf.layers.dense(l_r, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr1')
                     self.l_r = l_r
                     if self.image_shape is not None:
                         reconstruct = self._build_deconv(l_r, w_init)
@@ -347,7 +361,7 @@ class ACNet(object):
         SESS.run(ops)
 
     def choose_action(self, s):  # run by a local
-        temp = [obs[np.newaxis, :] for obs in s ]
+        temp = [obs[np.newaxis, :] for obs in s]
         feed_dict = {var: obs for var, obs in zip(self.s, temp)}
         if CONTINUOUS:
             action = np.squeeze(SESS.run(self.A, feed_dict=feed_dict)[0])
@@ -360,7 +374,7 @@ class ACNet(object):
 
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, debug=False, image_shape=None, stack=1, reconstruct=False):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, debug=False, image_shape=None, stack=1, hold=1, reconstruct=False):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=MAX_EP_STEPS)
         self.name = name
@@ -368,21 +382,28 @@ class Worker(object):
         self.debug = debug
         self.image_shape = image_shape
         self.stack = stack
+        self.hold = hold
         self.reconstruct = reconstruct
 
     def work(self):
         def get_img(fn, *args):
             img_lock.acquire()
             results = fn(*args)
-            img = self.env.render(mode='rgb_array')
+            if CONTINUOUS and type(self.env.env) is gym.envs.classic_control.pendulum.PendulumEnv:
+                img = self.env.render(mode='rgb_array_no_arrow')
+            else:
+                img = self.env.render(mode='rgb_array')
             img_lock.release()
             img = rgb2grey(img)
             img = resize(img, self.image_shape)
             return img, results
 
         def env_reset_obs():
-            #import ipdb; ipdb.set_trace()
-            return self.env.reset()
+            s = self.env.reset()
+            if type(self.env.env) is gym.envs.classic_control.pendulum.PendulumEnv:
+                self.env.env.state = np.array([np.pi, 0])
+                s = self.env.env._get_obs()
+            return s
 
         def env_reset_img():
             img, results = get_img(env_reset_obs)
@@ -406,15 +427,20 @@ class Worker(object):
         total_step = 1
         buffer_s, buffer_a, buffer_r = [], [], []
         while not COORD.should_stop() and GLOBAL_EP < MAX_GLOBAL_EP:
-            s = env_reset_fn()
+            s, _ = env_reset_fn()
 
             buffer_s = [s]*(self.stack-1)
             ep_r = 0
+            action_count = 0
             for ep_t in range(MAX_EP_STEPS):
             #while True:
                 buffer_s.append(s)
                 #a = self.AC.choose_action(buffer_s[-self.stack:])
-                a = self.AC.choose_action(buffer_s[-self.stack:])
+                if action_count % self.hold == 0:
+                    a = self.AC.choose_action(buffer_s[-self.stack:])
+                #if self.name == 'W_0':
+                #    print('ep_r: ', ep_r, '\taction: ', a)
+                action_count += 1
                 s_, r, done, info = env_step_fn(np.array([a])) # HACK
 
                 if CONTINUOUS:
@@ -545,6 +571,7 @@ def parse_args():
     parser.add_argument('--image_shape', nargs='*', default=None, help='Designates that images shoud be used in lieu of observations and what shpae to use for them.')
     parser.add_argument('--debug_worker', default=False, action='store_true')
     parser.add_argument('--reconstruct', default=False, action='store_true', help='Enables observation reconstruction as an additional learning signal.')
+    parser.add_argument('--hold', type=int, default=1, help='Number of time steps to hold the control.')
     args = parser.parse_args()
 
     if args.max_ep_steps > 0:
@@ -563,10 +590,10 @@ def parse_args():
     else:
         N_A = env.action_space.n
 
-    if args.entropy_beta > 0 and args.entropy_beta < 1:
+    if args.entropy_beta > 0:
         ENTROPY_BETA = args.entropy_beta
     else:
-        raise ValueError("entropy_beta must be between 0 and 1.")
+        raise ValueError("entropy_beta must be greater than 0.")
 
     if args.hard_share not in ['equal_params', 'equal_hiddens', 'none']:
         raise ValueError("Hard sharing options are 'equal_params' and 'equal_hiddens'.")
@@ -624,6 +651,9 @@ def parse_args():
         if args.stack < 2:
             args.stack = 2 # Automatically incorporate diffs with previous images
 
+    if args.hold < 1:
+        raise ValueError('Hold must be greater than or equal to one.')
+
     print("game: ", GAME)
     print("continuous ", CONTINUOUS)
     print("actions: ", N_A)
@@ -643,6 +673,8 @@ def parse_args():
     print("max_ep_steps: ", MAX_EP_STEPS)
     print("image_shape: ", image_shape)
     print("reconstruct: ", args.reconstruct)
+    print("stack: ", args.stack)
+    print("hold: ", args.hold)
 
     return args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class, image_shape
 
@@ -660,7 +692,7 @@ if __name__ == "__main__":
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, image_shape=image_shape, stack=args.stack, reconstruct=args.reconstruct))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, image_shape=image_shape, stack=args.stack, hold=args.hold, reconstruct=args.reconstruct))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -703,6 +735,7 @@ if __name__ == "__main__":
 
         for idx in range(10):
             s = env.reset()
+            env.state = np.array([0, 0])
             if image_shape is not None:
                 img = env.render(mode='rgb_array')
                 img = rgb2grey(img)
