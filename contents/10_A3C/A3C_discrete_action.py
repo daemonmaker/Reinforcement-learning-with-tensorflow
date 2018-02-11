@@ -43,7 +43,7 @@ N_WORKERS = multiprocessing.cpu_count()
 MAX_EP_STEPS = 1000
 MAX_GLOBAL_EP = 1000
 GLOBAL_NET_SCOPE = 'Global_Net'
-UPDATE_GLOBAL_ITER = 1000 #10
+UPDATE_GLOBAL_ITER = 10 #100 #10
 GAMMA = 0.9 #0.99 # 0.9
 ENTROPY_BETA = 0.001 # 0.001
 GLOBAL_RUNNING_R = []
@@ -58,7 +58,7 @@ CONTINUOUS = False
 
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.01, soft_sharing_coeff_critic=0.01, soft_sharing_coeff_reconstruct=0.01, gradient_clip_actor=1.0, gradient_clip_critic=1.0, gradient_clip_reconstruct=1.0, image_shape=None, stack=1, reconstruct=False):
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, image_shape=None, stack=1, reconstruct=False):
         self.hard_share = hard_share
         self.image_shape = image_shape
         self.stack = stack
@@ -112,7 +112,7 @@ class ACNet(object):
                     entropy_beta = ENTROPY_BETA
                     if CONTINUOUS:
                         entropy = normal_dist.entropy()  # encourage exploration
-                        entropy_beta = np.abs(np.random.randn(1))*ENTROPY_BETA
+                        #entropy_beta = np.abs(np.random.randn(1))*ENTROPY_BETA
                     else:
                         entropy = -tf.reduce_sum(self.a_prob * tf.log(self.a_prob + 1e-5),
                                                  axis=1, keep_dims=True)  # encourage exploration
@@ -133,6 +133,7 @@ class ACNet(object):
                 if self.reconstruct:
                     with tf.name_scope('reconstruction_loss'):
                         self.r_loss = tf.reduce_mean(tf.losses.mean_squared_error(self.s[-1], self.reconstruction))
+                        #self.r_loss = tf.reduce_mean(tf.keras.backend.binary_crossentropy(self.s[-1], self.reconstruction))
                         if soft_sharing_coeff_reconstruct > 0:
                             self.r_loss += soft_sharing_coeff_reconstruct*tf.nn.l2_loss(self.l_a - self.l_r)
                             self.r_loss += soft_sharing_coeff_reconstruct*tf.nn.l2_loss(self.l_c - self.l_r)
@@ -168,19 +169,22 @@ class ACNet(object):
         with tf.variable_scope('convs'):
             if self.stack == 2:
                 diff = inputs[1] - inputs[0]
-                inputs = tf.concat([inputs[1], diff], -1)
+                concat_inputs = tf.concat([inputs[1], diff], -1)
             else:
-                inputs = tf.concat(inputs, -1)
+                concat_inputs = tf.concat(inputs, -1)
 
-            conv1 = tf.layers.conv2d(self._batch_normalize(inputs), 64, 8, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
-            #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
-            conv2 = tf.layers.conv2d(self._batch_normalize(conv1), 32, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
-            #pool2 = tf.layers.max_pooling2d(conv2, 3, 1, name='p2')
-            conv3 = tf.layers.conv2d(self._batch_normalize(conv2), 16, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
-            #pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
-            #conv4 = tf.layers.conv2d(conv3, 8, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
-            self.flattened_conv = tf.layers.flatten(self._batch_normalize(conv3), name='flattened_conv')
-            inputs = tf.layers.dense(self.flattened_conv, 100, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
+            conv1 = tf.layers.conv2d(self._batch_normalize(concat_inputs), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c1')
+            pool1 = tf.layers.max_pooling2d(conv1, 2, 1, name='p1')
+            conv2 = tf.layers.conv2d(self._batch_normalize(pool1), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c2')
+            pool2 = tf.layers.max_pooling2d(conv2, 2, 1, name='p2')
+            conv3 = tf.layers.conv2d(self._batch_normalize(pool2), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c3')
+            conv4 = tf.layers.conv2d(conv3, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c4')
+            pool4 = tf.layers.max_pooling2d(conv4, 2, 1, name='p3')
+            conv5 = tf.layers.conv2d(self._batch_normalize(pool4), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c5')
+            conv6 = tf.layers.conv2d(conv5, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), name='c6')
+            self.flattened_conv = tf.layers.flatten(conv6, name='flattened_conv')
+            fc = tf.layers.dense(self.flattened_conv, 512, tf.nn.relu6, kernel_initializer=w_init, name='fc')
+            inputs = tf.layers.dense(fc, 512, tf.nn.relu6, kernel_initializer=w_init, name='inputs')
             '''
             # TODO DWEBB add stack support here
             diff = inputs[1] - inputs[0]
@@ -222,6 +226,7 @@ class ACNet(object):
                 inputs = self._build_conv(inputs, w_init)
             else:
                 inputs = tf.concat(inputs, 1)
+
             if self.hard_share == 'equal_params':
                 with tf.variable_scope('shared'):
                     l_s = tf.layers.dense(inputs, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
@@ -288,13 +293,20 @@ class ACNet(object):
 
             s_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/shared')
         else:
+            if self.image_shape is not None:
+                concat_inputs = self._build_conv(inputs, w_init)
+            else:
+                concat_inputs = tf.concat(inputs, 1)
+
             with tf.variable_scope('actor'):
+                '''
                 if self.image_shape is not None:
-                    conv_inputs = self._build_conv(inputs, w_init)
+                    concat_inputs = self._build_conv(inputs, w_init)
                 else:
-                    conv_inputs = tf.concat(inputs, 1)
-                l_a = tf.layers.dense(conv_inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                l_a = tf.layers.dense(l_a, 100, tf.nn.relu6, kernel_initializer=w_init, name='la1')
+                    concat_inputs = tf.concat(inputs, 1)
+                '''
+                l_a = tf.layers.dense(concat_inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
+                #l_a = tf.layers.dense(l_a, 100, tf.nn.relu6, kernel_initializer=w_init, name='la1')
                 self.l_a = l_a
                 if CONTINUOUS:
                     mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
@@ -303,21 +315,25 @@ class ACNet(object):
                 else:
                     a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
             with tf.variable_scope('critic'):
+                '''
                 if self.image_shape is not None:
-                    conv_inputs = self._build_conv(inputs, w_init)
+                    concat_inputs = self._build_conv(inputs, w_init)
                 else:
-                    conv_inputs = tf.concat(inputs, 1)
-                l_c = tf.layers.dense(conv_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                l_c = tf.layers.dense(l_c, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc1')
+                    concat_inputs = tf.concat(inputs, 1)
+                '''
+                l_c = tf.layers.dense(concat_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+                #l_c = tf.layers.dense(l_c, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc1')
                 self.l_c = l_c
                 v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
             if self.reconstruct:
                 with tf.variable_scope('reconstruct'):
+                    '''
                     if self.image_shape is not None:
-                        conv_inputs = self._build_conv(inputs, w_init)
+                        concat_inputs = self._build_conv(inputs, w_init)
                     else:
-                        conv_inputs = tf.concat(inputs, 1)
-                    l_r = tf.layers.dense(conv_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
+                        concat_inputs = tf.concat(inputs, 1)
+                    '''
+                    l_r = tf.layers.dense(concat_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
                     l_r = tf.layers.dense(l_r, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr1')
                     self.l_r = l_r
                     if self.image_shape is not None:
@@ -329,7 +345,8 @@ class ACNet(object):
         c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
         if self.image_shape is not None:
             i_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/convs')
-            i_params += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/deconvs')
+            if self.reconstruct:
+                i_params += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/deconvs')
         else:
             i_params = []
         if self.reconstruct:
@@ -400,10 +417,10 @@ class Worker(object):
 
         def env_reset_obs():
             s = self.env.reset()
-            if type(self.env.env) is gym.envs.classic_control.pendulum.PendulumEnv:
-                self.env.env.state = np.array([np.pi, 0])
-                s = self.env.env._get_obs()
-            return s
+            #if type(self.env.env) is gym.envs.classic_control.pendulum.PendulumEnv:
+            #    self.env.env.state = np.array([np.pi, 0])
+            #    s = self.env.env._get_obs()
+            return s, None
 
         def env_reset_img():
             img, results = get_img(env_reset_obs)
@@ -435,7 +452,6 @@ class Worker(object):
             for ep_t in range(MAX_EP_STEPS):
             #while True:
                 buffer_s.append(s)
-                #a = self.AC.choose_action(buffer_s[-self.stack:])
                 if action_count % self.hold == 0:
                     a = self.AC.choose_action(buffer_s[-self.stack:])
                 #if self.name == 'W_0':
@@ -523,7 +539,10 @@ class Worker(object):
                         else:
                             GLOBAL_RUNNING_R.append(0.99 * GLOBAL_RUNNING_R[-1] + 0.01 * ep_r)
 
-                    print(self.name, ' Ep: ', GLOBAL_EP, ' | Ep_r av: ', GLOBAL_RUNNING_R[-1], ' | Ep_r: ', ep_r)
+                    print(self.name, ' Ep: ', GLOBAL_EP, ' | Ep_r av: ', GLOBAL_RUNNING_R[-1], ' | Ep_r: ', ep_r, end='')
+                    if self.reconstruct:
+                        print(' | r_loss: ', r_loss, end='')
+                    print('')
                     '''
                     log_lock.acquire()
                     logger.record_tabular("global_ep", GLOBAL_EP)
@@ -544,7 +563,7 @@ class Worker(object):
 
 
 def parse_args():
-    global GAME, A_BOUND, ENTROPY_BETA, MAX_EP_STEPS, MAX_GLOBAL_EP, N_S, N_A, CONTINUOUS
+    global GAME, A_BOUND, ENTROPY_BETA, MAX_EP_STEPS, UPDATE_GLOBAL_ITER, MAX_GLOBAL_EP, N_S, N_A, CONTINUOUS
 
     parser = argparse.ArgumentParser(description='Run A3C on discrete cart-pole.')
     parser.add_argument('--game', default='CartPole-v0', help='Which environment to learn to control.')
@@ -564,8 +583,9 @@ def parse_args():
     parser.add_argument('--lr_a', type=float, default=0.001, help='Sets the learning rate of the actor.')
     parser.add_argument('--lr_c', type=float, default=0.001, help='Sets the learning rate of the critic.')
     parser.add_argument('--lr_r', type=float, default=0.001, help='Sets the learning rate of the reconstruction.')
-    parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
     parser.add_argument('--log', default=False, action='store_true', help='Enables logging.')
+    parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
+    parser.add_argument('--update_global_iter', type=int, default=100, help='How frequently to update the global AC.')
     parser.add_argument('--max_ep_steps', type=int, default=1000, help='The number of time steps per episode before calling the episode done.')
     parser.add_argument('--stack', type=int, default=1, help='Number of observations to use for state.')
     parser.add_argument('--image_shape', nargs='*', default=None, help='Designates that images shoud be used in lieu of observations and what shpae to use for them.')
@@ -626,6 +646,12 @@ def parse_args():
         lr_r = args.lr
 
     MAX_GLOBAL_EP = args.max_global_ep
+    if MAX_GLOBAL_EP < 1:
+        raise ValueError('max_global_ep must be a postive integer.')
+
+    UPDATE_GLOBAL_ITER = args.update_global_iter
+    if UPDATE_GLOBAL_ITER < 1:
+        raise ValueError('update_global_iter must be a postive integer.')
     '''
     if args.log:
         logger.configure('tmp')
@@ -668,8 +694,9 @@ def parse_args():
     print("learning rate, actor: ", lr_a)
     print("learning rate, critic: ", lr_c)
     print("learning rate, reconstruct: ", lr_r)
-    print("max_global_ep: ", MAX_GLOBAL_EP)
     print("optimizer_class: ", optimizer_class)
+    print("max_global_ep: ", MAX_GLOBAL_EP)
+    print("update_global_iter: ", UPDATE_GLOBAL_ITER)
     print("max_ep_steps: ", MAX_EP_STEPS)
     print("image_shape: ", image_shape)
     print("reconstruct: ", args.reconstruct)
@@ -683,10 +710,12 @@ if __name__ == "__main__":
     args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class, image_shape = parse_args()
     SESS = tf.Session()
 
+    import ipdb; ipdb.set_trace()
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
-        OPT_R = optimizer_class(lr_r, name='reconstruct_opt')
+        if args.reconstruct:
+            OPT_R = optimizer_class(lr_r, name='reconstruct_opt')
         GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, image_shape=image_shape, stack=args.stack, reconstruct=args.reconstruct)  # we only need its params
         workers = []
         # Create worker
