@@ -87,8 +87,11 @@ def env_reset_img(env):
     img, results = get_img(env, env_reset_obs)
     return img, results
 
+def env_get_obs(env):
+    return env.env._get_obs()
+
 def env_get_img(env):
-    img, _ = get_img(env, lambda x: x)
+    img, _ = get_img(env, env_get_obs)
     return img
 
 def env_step_obs(env, a):
@@ -234,7 +237,6 @@ class ACNet(object):
                         elif self.reconstruct == 'bce':
                             self.r_loss = tf.reduce_mean(tf.keras.backend.binary_crossentropy(self.s[-1], self.reconstruction))
                         elif self.reconstruct == 'vae':
-                            #self.r_loss = tf.reduce_mean(tf.losses.mean_squared_error(self.s[-1], self.reconstruction))
                             x = KK.flatten(self.s[0])
                             x_decoded_mean_squash_flat = KK.flatten(self.reconstruction)
 
@@ -296,7 +298,7 @@ class ACNet(object):
                 conv3 = tf.layers.conv2d(pool2, 64, 5, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c3')
                 pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
                 flattened_conv = tf.layers.flatten(conv2, name='flattened_conv')
-                obs = tf.layers.dense(flattened_conv, 25, tf.nn.relu6, kernel_initializer=self.w_init, reuse=reuse, name='fc')
+                obs = tf.layers.dense(flattened_conv, 360, tf.nn.relu6, kernel_initializer=self.w_init, reuse=reuse, name='fc')
             final = tf.layers.dense(obs, n_out, tf.nn.relu6, kernel_initializer=self.w_init, reuse=reuse, name='processed_obs')
         return final
 
@@ -355,8 +357,8 @@ class ACNet(object):
     def _build_deconv(self, inputs, reuse=False):
         with tf.variable_scope('deconvs'):
             # TODO DWEBB fix these magic numbers!
-            temp = tf.layers.dense(inputs, 75, reuse=reuse, name='temp')
-            inputs = tf.reshape(temp, [-1, 5, 5, 3], name='reshaped_flat')
+            temp = tf.layers.dense(inputs, 25, reuse=reuse, name='temp')
+            inputs = tf.reshape(temp, [-1, 5, 5, 1], name='reshaped_flat')
             deconv1 = tf.layers.conv2d_transpose(inputs, 32, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d1')
             deconv2 = tf.layers.conv2d_transpose(deconv1, 64, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d2')
             inputs = tf.layers.conv2d_transpose(deconv2, 3, 8, strides=(2,2), padding='same', activation=tf.sigmoid, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d3')
@@ -930,7 +932,7 @@ def parse_args():
             raise ValueError('stack should be less than or equal to 2 for use with obs_diff.')
 
     if args.image_shape is not None:
-        IMAGE_SHAPE = tuple(map(int, args.image_shape[0].split(','))) + (1,) # Add the number of channels which will always be 1 for grey scale
+        IMAGE_SHAPE = tuple(map(int, args.image_shape[0].split(','))) + (3,) # Add the number of channels which will always be 3 for RGB images
 
         env_reset_fn = env_reset_img
         env_step_fn = env_step_img
@@ -1008,7 +1010,6 @@ def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
             else:
                 s = env.env._get_obs()
 
-        s = env.env._get_obs()
         env.render()
         buffer_s = [s]*(args.stack-1)
         tidx = 0
