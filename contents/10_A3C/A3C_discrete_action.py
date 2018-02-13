@@ -72,7 +72,7 @@ def get_img(env, fn, *args):
     else:
         img = env.render(mode='rgb_array')
     img_lock.release()
-    img = rgb2grey(img)
+    #img = rgb2grey(img)
     img = resize(img, IMAGE_SHAPE)
     return img, results
 
@@ -108,7 +108,9 @@ def summarize_weights():
         print(layer)
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, stack=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
+    def __init__(self, scope, w_init, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, stack=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
+        self.scope = scope
+        self.w_init = w_init
         self.hard_share = hard_share
         self.stack = stack
         self.forward_predict = forward_predict
@@ -284,31 +286,28 @@ class ACNet(object):
         else:
             return inputs
 
-    def _build_obs_processor(self, obs, w_init, n_out, reuse, scope):
+    def _build_obs_processor(self, obs, n_out, reuse, scope):
         with tf.variable_scope(scope):
             if IMAGE_SHAPE is not None:
-                conv1 = tf.layers.conv2d(self._batch_normalize(obs), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c1')
+                conv1 = tf.layers.conv2d(obs, 32, 5, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c1')
                 pool1 = tf.layers.max_pooling2d(conv1, 2, 1, name='p1')
-                conv2 = tf.layers.conv2d(self._batch_normalize(pool1), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c2')
+                conv2 = tf.layers.conv2d(pool1, 64, 5, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c2')
                 pool2 = tf.layers.max_pooling2d(conv2, 2, 1, name='p2')
-                conv3 = tf.layers.conv2d(self._batch_normalize(pool2), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c3')
-                conv4 = tf.layers.conv2d(conv3, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c4')
-                pool4 = tf.layers.max_pooling2d(conv4, 2, 1, name='p3')
-                conv5 = tf.layers.conv2d(self._batch_normalize(pool4), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c5')
-                conv6 = tf.layers.conv2d(conv5, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c6')
-                flattened_conv = tf.layers.flatten(conv6, name='flattened_conv')
-                obs = tf.layers.dense(flattened_conv, 512, tf.nn.relu6, kernel_initializer=w_init, reuse=reuse, name='fc')
-            final = tf.layers.dense(obs, n_out, tf.nn.relu6, kernel_initializer=w_init, reuse=reuse, name='processed_obs')
+                conv3 = tf.layers.conv2d(pool2, 64, 5, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c3')
+                pool3 = tf.layers.max_pooling2d(conv3, 3, 1, name='p3')
+                flattened_conv = tf.layers.flatten(conv2, name='flattened_conv')
+                obs = tf.layers.dense(flattened_conv, 25, tf.nn.relu6, kernel_initializer=self.w_init, reuse=reuse, name='fc')
+            final = tf.layers.dense(obs, n_out, tf.nn.relu6, kernel_initializer=self.w_init, reuse=reuse, name='processed_obs')
         return final
 
-    def _process_inputs(self, obses, w_init, n_out, reuse=False, share_processor=False):
+    def _process_inputs(self, obses, n_out, reuse=False, share_processor=False):
         if share_processor:
             scope_template = 'input_processor'
         else:
             scope_template = 'input_processor_{}'
         processed_inputs = []
         for idx, obs in enumerate(obses):
-            processed_inputs.append(self._build_obs_processor(obs, w_init, n_out, reuse, scope=scope_template.format(idx)))
+            processed_inputs.append(self._build_obs_processor(obs, n_out, reuse, scope=scope_template.format(idx)))
             if share_processor: reuse=True
         processed_inputs = tf.concat(processed_inputs, -1)
         return processed_inputs
@@ -353,56 +352,55 @@ class ACNet(object):
             '''
         return inputs
 
-    def _build_deconv(self, inputs, w_init, reuse=False):
+    def _build_deconv(self, inputs, reuse=False):
         with tf.variable_scope('deconvs'):
-            temp = tf.layers.dense(inputs, 400, reuse=reuse, name='temp')
-            inputs = tf.reshape(temp, [-1, 5, 5, 16], name='reshaped_flat')
-            deconv1 = tf.layers.conv2d_transpose(inputs, 32, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d1')
-            deconv2 = tf.layers.conv2d_transpose(deconv1, 32, 3, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d2')
-            deconv3 = tf.layers.conv2d_transpose(deconv2, 16, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d3')
-            inputs = tf.layers.conv2d_transpose(deconv3, 1, 8, strides=(1,1), padding='same', activation=tf.sigmoid, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d4')
-            #inputs = deconv2
+            # TODO DWEBB fix these magic numbers!
+            temp = tf.layers.dense(inputs, 75, reuse=reuse, name='temp')
+            inputs = tf.reshape(temp, [-1, 5, 5, 3], name='reshaped_flat')
+            deconv1 = tf.layers.conv2d_transpose(inputs, 32, 5, strides=(3,3), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d1')
+            deconv2 = tf.layers.conv2d_transpose(deconv1, 64, 5, strides=(2,2), padding='same', activation=tf.nn.relu, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d2')
+            inputs = tf.layers.conv2d_transpose(deconv2, 3, 8, strides=(2,2), padding='same', activation=tf.sigmoid, kernel_initializer=self.w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='d3')
         return inputs
 
-    def _vae_sample(self, h, w_init):
-        z_mean = tf.layers.dense(h, N_VAE, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-        z_log_var = tf.layers.dense(h, N_VAE, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
+    def _vae_sample(self, h):
+        z_mean = tf.layers.dense(h, N_VAE, tf.nn.tanh, kernel_initializer=self.w_init, name='mu')
+        z_log_var = tf.layers.dense(h, N_VAE, tf.nn.softplus, kernel_initializer=self.w_init, name='sigma')
         z = tf.squeeze(z_mean + tf.exp(z_log_var)*tf.distributions.Normal(tf.zeros(tf.shape(z_mean)), tf.ones(tf.shape(z_mean))).sample(1), 0)
         return z_mean, z_log_var, z
 
-    def _build_hard_share(self, scope, w_init, n_out = 300, share_input_processor=False):
+    def _build_hard_share(self, scope, n_out = 300, share_input_processor=False):
         with tf.variable_scope('input_processor'):
-            l_p = self._process_inputs(self.s, w_init, n_out, share_processor=share_input_processor)
+            l_p = self._process_inputs(self.s, self.w_init, n_out, share_processor=share_input_processor)
 
         with tf.variable_scope('actor'):
             if CONTINUOUS:
-                mu = tf.layers.dense(l_p, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                sigma = tf.layers.dense(l_p, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
+                mu = tf.layers.dense(l_p, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='mu')
+                sigma = tf.layers.dense(l_p, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='sigma')
                 a_prob = (mu, sigma)
             else:
-                a_prob = tf.layers.dense(l_p, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
+                a_prob = tf.layers.dense(l_p, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
 
         with tf.variable_scope('critic'):
-            v = tf.layers.dense(l_p, 1, kernel_initializer=w_init, name='v')  # state value
+            v = tf.layers.dense(l_p, 1, kernel_initializer=self.w_init, name='v')  # state value
 
         with tf.variable_scope('forward_predict'):
             fp_h = l_p
-            fp_h = tf.layers.dense(fp_h, n_out, tf.nn.relu, kernel_initializer=w_init, name='fp')
+            fp_h = tf.layers.dense(fp_h, n_out, tf.nn.relu, kernel_initializer=self.w_init, name='fp')
             if self.forward_predict == 'vae':
-                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h, w_init)
+                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
                 fp_h = self.fp_z
             if IMAGE_SHAPE is not None:
-                forward_prediction = self._build_deconv(fp_h, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
             else:
-                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='r')
+                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=self.w_init,  name='r')
 
         with tf.variable_scope('reconstruct'):
             r_p = l_p
             if self.reconstruct == 'vae':
-                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(r_p, w_init)
+                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(r_p)
                 r_p = self.vae_z
             if IMAGE_SHAPE is not None:
-                reconstruct = self._build_deconv(r_p, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                reconstruct = self._build_deconv(r_p, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
             else:
                 reconstruct = tf.layers.dense(r_p, N_S, kernel_initializer=w_init,  name='r')
 
@@ -418,41 +416,41 @@ class ACNet(object):
 
         return outputs, params
 
-    def _build_soft_share(self, scope, w_init, n_hiddens, share_input_processor=False):
+    def _build_soft_share(self, scope, n_hiddens, share_input_processor=False):
         # TODO DWEBB Store links to the different layers so they can be penalized with soft sharing schemes, e.g. via the regularization in the loss.
         with tf.variable_scope('actor'):
-            self.l_a = self._process_inputs(self.s, w_init, n_hiddens['a'], share_processor=share_input_processor)
+            self.l_a = self._process_inputs(self.s, n_hiddens['a'], share_processor=share_input_processor)
             if CONTINUOUS:
-                mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='a_mu')
-                sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='a_sigma')
+                mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='a_mu')
+                sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='a_sigma')
                 a_prob = (mu, sigma)
             else:
-                a_prob = tf.layers.dense(self.l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
+                a_prob = tf.layers.dense(self.l_a, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
 
         with tf.variable_scope('critic'):
-            self.l_c = self._process_inputs(self.s, w_init, n_hiddens['c'], share_processor=share_input_processor)
-            v = tf.layers.dense(self.l_c, 1, kernel_initializer=w_init, name='v')  # state value
+            self.l_c = self._process_inputs(self.s, n_hiddens['c'], share_processor=share_input_processor)
+            v = tf.layers.dense(self.l_c, 1, kernel_initializer=self.w_init, name='v')  # state value
 
         with tf.variable_scope('forward_predict'):
-            self.l_f = self._process_inputs(self.s, w_init, n_hiddens['f'], share_processor=share_input_processor)
+            self.l_f = self._process_inputs(self.s, n_hiddens['f'], share_processor=share_input_processor)
             fp_h = tf.layers.dense(self.l_f, n_hiddens['f'], tf.nn.relu, kernel_initializer=w_init, name='fp_h')
             if self.forward_predict == 'vae':
-                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h, w_init)
+                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
                 fp_h = self.vae_z
             if IMAGE_SHAPE is not None:
-                forward_prediction = self._build_deconv(fp_h, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
             else:
                 forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='fp')
 
         with tf.variable_scope('reconstruct'):
-            self.l_r = self._process_inputs(self.s, w_init, n_hiddens['r'], share_processor=share_input_processor)
+            self.l_r = self._process_inputs(self.s, n_hiddens['r'], share_processor=share_input_processor)
             if self.reconstruct == 'vae':
-                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r, w_init)
+                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r)
                 self.l_r = self.vae_z
             if IMAGE_SHAPE is not None:
-                reconstruct = self._build_deconv(self.l_r, w_init, reuse=False)
+                reconstruct = self._build_deconv(self.l_r, reuse=False)
             else:
-                reconstruct = tf.layers.dense(self.l_r, N_S, kernel_initializer=w_init, name='r')
+                reconstruct = tf.layers.dense(self.l_r, N_S, kernel_initializer=self.w_init, name='r')
 
         outputs = {'a_prob': a_prob, 'v': v, 'reconstruct': reconstruct, 'forward_predict': forward_prediction}
         params = {
@@ -465,8 +463,6 @@ class ACNet(object):
         return outputs, params
 
     def _build_net(self, scope):
-        w_init = tf.random_normal_initializer(0., .1)
-
         n_hiddens = {'a': 200, 'c': 100, 'r': 100, 'f': 100}
         if self.hard_share is not None:
             n_out = np.sum(list(n_hiddens.values()))
@@ -474,9 +470,9 @@ class ACNet(object):
                 n_out -= n_hiddens['f']
             if not self.reconstruct:
                 n_out -= n_hiddens['r']
-            outputs, params = self._build_hard_share(scope, w_init, n_out=n_out, share_input_processor=True)
+            outputs, params = self._build_hard_share(scope, n_out=n_out, share_input_processor=True)
         else:
-            outputs, params = self._build_soft_share(scope, w_init, n_hiddens=n_hiddens, share_input_processor=False)
+            outputs, params = self._build_soft_share(scope, n_hiddens=n_hiddens, share_input_processor=False)
 
         return outputs, params
 
@@ -667,11 +663,11 @@ class ACNet(object):
         return action
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, debug=False, stack=1, hold=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
+    def __init__(self, name, w_init, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, debug=False, stack=1, hold=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=MAX_EP_STEPS)
         self.name = name
-        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, soft_sharing_coeff_reconstruct=soft_sharing_coeff_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, stack=stack, forward_predict=forward_predict, reconstruct=reconstruct, batch_normalize=batch_normalize, obs_diff=obs_diff)
+        self.AC = ACNet(name, w_init, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, soft_sharing_coeff_reconstruct=soft_sharing_coeff_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, stack=stack, forward_predict=forward_predict, reconstruct=reconstruct, batch_normalize=batch_normalize, obs_diff=obs_diff)
         self.debug = debug
         self.stack = stack
         self.hold = hold
@@ -808,6 +804,8 @@ def parse_args():
     global GAME, A_BOUND, ENTROPY_BETA, MAX_EP_STEPS, UPDATE_GLOBAL_ITER, MAX_GLOBAL_EP, N_S, N_A, IMAGE_SHAPE, CONTINUOUS, N_WORKERS
     global env_reset_fn, env_step_fn
 
+    initializers = ['orthogonal', 'standard_normal']
+
     parser = argparse.ArgumentParser(description='Run A3C on discrete cart-pole.')
     parser.add_argument('--game', default='CartPole-v0', help='Which environment to learn to control.')
     parser.add_argument('--entropy_beta', type=float, default=0.01, help="Value for the entropy beta term.")
@@ -841,6 +839,7 @@ def parse_args():
     parser.add_argument('--obs_diff', default=False, action='store_true', help='Requires stack = 2 and uses a difference between the current and previous observation as the second input.')
     parser.add_argument('--tests', type=int, default=10, help='The number of times to simulate the system after training.')
     parser.add_argument('--forward_predict', default=False, help='Enables forward predictions.')
+    parser.add_argument('--initializer', type=str, default='orthogonal', help='The initializer to use for the weights. Valid values are: {}'.format(initializers))
     args = parser.parse_args()
 
     if args.max_ep_steps > 0:
@@ -954,6 +953,15 @@ def parse_args():
     if args.tests < 0:
         raise ValueError("tests must be greater than or equal to 0.")
 
+    if args.initializer not in initializers:
+        raise ValueError("initializer must be one of: {}".format(initializers))
+    elif args.initializer == 'standard_normal':
+        w_init = tf.random_normal_initializer(0., 1.)
+    else: # orthogonal
+        if args.initializer is not 'orthogonal':
+            print('Unknown initializer ({}) defaulting to orthogonal initialization.')
+        w_init = tf.orthogonal_initializer()
+
     print("game: ", GAME)
     print("continuous ", CONTINUOUS)
     print("actions: ", N_A)
@@ -979,24 +987,28 @@ def parse_args():
     print("stack: ", args.stack)
     print("hold: ", args.hold)
     print("tests: ", args.tests)
+    print("initializer: ", args.initializer)
 
-    return args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class
+    return args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class, w_init
 
 
-def run_tests(n_tests):
+def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
     ep_rs = []
     buffer_a = []
     buffer_r = []
     for idx in range(n_tests):
         s = env_reset_fn(env)
-        env.env.state = np.array([np.pi, 0])
-        if IMAGE_SHAPE is not None:
-            s = env_get_img(env)
-            #img = env.render(mode='rgb_array')
-            #img = rgb2grey(img)
-            #s = resize(img, IMAGE_SHAPE)
-        else:
-            s = env.env._get_obs()
+        if not randomize_start:
+            env.env.state = start_state
+            if IMAGE_SHAPE is not None:
+                s = env_get_img(env)
+                #img = env.render(mode='rgb_array')
+                #img = rgb2grey(img)
+                #s = resize(img, IMAGE_SHAPE)
+            else:
+                s = env.env._get_obs()
+
+        s = env.env._get_obs()
         env.render()
         buffer_s = [s]*(args.stack-1)
         tidx = 0
@@ -1023,12 +1035,15 @@ def run_tests(n_tests):
         buffer_s_ = np.vstack(buffer_s)
         reconstructions = SESS.run(GLOBAL_AC.reconstruction, feed_dict={GLOBAL_AC.s[0]: buffer_s_})
         print('Mean reconstruction error: ',np.mean( buffer_s_ - reconstructions))
-
+        
+        plt.imshow(np.squeeze(reconstructions[0]))
+        plt.show()
+        
     return ep_rs, buffer_s, buffer_a, buffer_r, reconstructions
 
 
 if __name__ == "__main__":
-    args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class = parse_args()
+    args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class, w_init = parse_args()
     SESS = tf.Session()
 
     with tf.device("/cpu:0"):
@@ -1038,12 +1053,12 @@ if __name__ == "__main__":
             OPT_F = optimizer_class(lr_f, name='forward_predict_opt')
         if args.reconstruct:
             OPT_R = optimizer_class(lr_r, name='reconstruct_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, stack=args.stack, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff)  # we only need its params
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, w_init, hard_share=args.hard_share, stack=args.stack, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, stack=args.stack, hold=args.hold, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff))
+            workers.append(Worker(i_name, w_init, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, stack=args.stack, hold=args.hold, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
@@ -1053,7 +1068,7 @@ if __name__ == "__main__":
             shutil.rmtree(LOG_DIR)
         tf.summary.FileWriter(LOG_DIR, SESS.graph)
 
-    if args.debug_worker:
+    if N_WORKERS == 1 or args.debug_worker:
         workers[0].work()
     else:
         tic = time.clock()
