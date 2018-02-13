@@ -35,6 +35,7 @@ import time
 import numpy as np
 from keras import metrics
 import keras.backend as KK
+from keras.layers import UpSampling2D
 
 
 img_lock = threading.Lock()
@@ -58,8 +59,10 @@ N_S = 0
 IMAGE_SHAPE = None
 N_A = 0
 N_VAE = 3
+N_FORWARD = 3
 A_BOUND = []
 CONTINUOUS = False
+
 
 def get_img(env, fn, *args):
     img_lock.acquire()
@@ -105,9 +108,10 @@ def summarize_weights():
         print(layer)
 
 class ACNet(object):
-    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, stack=1, reconstruct=False, batch_normalize=False, obs_diff=False):
+    def __init__(self, scope, globalAC=None, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, stack=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
         self.hard_share = hard_share
         self.stack = stack
+        self.forward_predict = forward_predict
         self.reconstruct = reconstruct
         self.batch_normalize = batch_normalize
         self.obs_diff = obs_diff
@@ -126,9 +130,11 @@ class ACNet(object):
                 self.outputs, self.params = self._build_net(scope)
                 self.a_prob = self.outputs['a_prob']
                 self.v = self.outputs['v']
+                self.forward_prediction = self.outputs['forward_predict']
                 self.reconstruction = self.outputs['reconstruct']
                 self.a_params = self.params['a_params']
                 self.c_params = self.params['c_params']
+                self.f_params = self.params['f_params']
                 self.r_params = self.params['r_params']
 
                 if CONTINUOUS:
@@ -147,18 +153,22 @@ class ACNet(object):
         else:   # local net, calculate losses
             with tf.variable_scope(scope):
                 self.s = input_placeholders()
+                forward_shape = [None, N_S] if IMAGE_SHAPE is None else [None, ] + list(IMAGE_SHAPE)
+                self.f_target = tf.placeholder(tf.float32, forward_shape, 'forward_prediction_targets')
                 action_shape = [None, N_A] if CONTINUOUS else [None, ]
                 a_dtype = tf.float32 if CONTINUOUS else tf.int32
-                self.a_his = tf.placeholder(a_dtype, action_shape, 'A')
-                self.v_target = tf.placeholder(tf.float32, [None, 1], 'Vtarget')
+                self.a_his = tf.placeholder(a_dtype, action_shape, 'actions')
+                self.v_target = tf.placeholder(tf.float32, [None, 1], 'value_targets')
 
                 #self.a_prob, self.v, self.reconstruction, self.a_params, self.c_params, self.r_params = self._build_net(scope)
                 self.outputs, self.params = self._build_net(scope)
                 self.a_prob = self.outputs['a_prob']
                 self.v = self.outputs['v']
                 self.reconstruction = self.outputs['reconstruct']
+                self.forward_prediction = self.outputs['forward_predict']
                 self.a_params = self.params['a_params']
                 self.c_params = self.params['c_params']
+                self.f_params = self.params['f_params']
                 self.r_params = self.params['r_params']
                 if CONTINUOUS:
                     mu = self.a_prob[0]
@@ -206,6 +216,15 @@ class ACNet(object):
                     with tf.name_scope('choose_a'):  # use local params to choose action
                         self.A = tf.clip_by_value(tf.squeeze(normal_dist.sample(1), axis=0), A_BOUND[0], A_BOUND[1])
 
+                if self.forward_predict:
+                    with tf.name_scope('forward_prediction_loss'):
+                        if self.forward_predict == 'vae':
+                            raise NotImplementedError()
+                        elif self.forward_predict == 'mse':
+                            self.f_loss = tf.reduce_mean(tf.losses.mean_squared_error(self.f_target, self.forward_prediction))
+                        else:
+                            raise ValueError('Unknown forward prediction type.')
+
                 if self.reconstruct:
                     with tf.name_scope('reconstruction_loss'):
                         if self.reconstruct == 'mse':
@@ -236,22 +255,28 @@ class ACNet(object):
                     self.c_grads = tf.gradients(self.c_loss, self.c_params)
                     if gradient_clip_critic > 0:
                         self.c_grads, _ = tf.clip_by_global_norm(self.c_grads, gradient_clip_critic)
+                    if self.forward_predict:
+                        self.f_grads = tf.gradients(self.f_loss, self.f_params)
+                        if gradient_clip_forward > 0:
+                            self.f_grads, _ = tf.clip_by_global_norm(self.f_grads, gradient_clip_forward)
                     if self.reconstruct:
                         self.r_grads = tf.gradients(self.r_loss, self.r_params)
                         if gradient_clip_reconstruct > 0:
                             self.r_grads, _ = tf.clip_by_global_norm(self.r_grads, gradient_clip_reconstruct)
 
-            with tf.name_scope('sync'):
-                with tf.name_scope('pull'):
-                    self.pull_a_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.a_params, globalAC.a_params)]
-                    self.pull_c_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.c_params, globalAC.c_params)]
-                    if self.reconstruct:
-                        self.pull_r_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.r_params, globalAC.r_params)]
-                with tf.name_scope('push'):
-                    self.update_a_op = OPT_A.apply_gradients(zip(self.a_grads, globalAC.a_params))
-                    self.update_c_op = OPT_C.apply_gradients(zip(self.c_grads, globalAC.c_params))
-                    if self.reconstruct:
-                        self.update_r_op = OPT_R.apply_gradients(zip(self.r_grads, globalAC.r_params))
+                with tf.name_scope('sync'):
+                    with tf.name_scope('pull'):
+                        self.pull_a_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.a_params, globalAC.a_params)]
+                        self.pull_c_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.c_params, globalAC.c_params)]
+                        if self.reconstruct:
+                            self.pull_r_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.r_params, globalAC.r_params)]
+                    with tf.name_scope('push'):
+                        self.update_a_op = OPT_A.apply_gradients(zip(self.a_grads, globalAC.a_params))
+                        self.update_c_op = OPT_C.apply_gradients(zip(self.c_grads, globalAC.c_params))
+                        if self.forward_predict:
+                            self.update_f_op = OPT_F.apply_gradients(zip(self.f_grads, globalAC.f_params))
+                        if self.reconstruct:
+                            self.update_r_op = OPT_R.apply_gradients(zip(self.r_grads, globalAC.r_params))
 
     def _batch_normalize(self, inputs):
         if self.batch_normalize:
@@ -340,9 +365,10 @@ class ACNet(object):
         return inputs
 
     def _vae_sample(self, h, w_init):
-        self.vae_z_mean = tf.layers.dense(h, N_VAE, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-        self.vae_z_log_var = tf.layers.dense(h, N_VAE, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
-        self.vae_z = tf.squeeze(self.vae_z_mean + tf.exp(self.vae_z_log_var)*tf.distributions.Normal(tf.zeros(tf.shape(self.vae_z_mean)), tf.ones(tf.shape(self.vae_z_mean))).sample(1), 0)
+        z_mean = tf.layers.dense(h, N_VAE, tf.nn.tanh, kernel_initializer=w_init, name='mu')
+        z_log_var = tf.layers.dense(h, N_VAE, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
+        z = tf.squeeze(z_mean + tf.exp(z_log_var)*tf.distributions.Normal(tf.zeros(tf.shape(z_mean)), tf.ones(tf.shape(z_mean))).sample(1), 0)
+        return z_mean, z_log_var, z
 
     def _build_hard_share(self, scope, w_init, n_out = 300, share_input_processor=False):
         with tf.variable_scope('input_processor'):
@@ -359,20 +385,34 @@ class ACNet(object):
         with tf.variable_scope('critic'):
             v = tf.layers.dense(l_p, 1, kernel_initializer=w_init, name='v')  # state value
 
-        with tf.variable_scope('reconstruct'):
-            if self.reconstruct == 'vae':
-                self._vae_sample(l_p, w_init)
-                l_p = self.vae_z
+        with tf.variable_scope('forward_predict'):
+            fp_h = l_p
+            fp_h = tf.layers.dense(fp_h, n_out, tf.nn.relu, kernel_initializer=w_init, name='fp')
+            if self.forward_predict == 'vae':
+                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h, w_init)
+                fp_h = self.fp_z
             if IMAGE_SHAPE is not None:
-                reconstruct = self._build_deconv(l_p, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                forward_prediction = self._build_deconv(fp_h, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
             else:
-                reconstruct = tf.layers.dense(l_p, N_S, kernel_initializer=w_init,  name='r')
+                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='r')
 
-        outputs = {'a_prob': a_prob, 'v': v, 'reconstruct': reconstruct}
+        with tf.variable_scope('reconstruct'):
+            r_p = l_p
+            if self.reconstruct == 'vae':
+                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(r_p, w_init)
+                r_p = self.vae_z
+            if IMAGE_SHAPE is not None:
+                reconstruct = self._build_deconv(r_p, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+            else:
+                reconstruct = tf.layers.dense(r_p, N_S, kernel_initializer=w_init,  name='r')
+
+
+        outputs = {'a_prob': a_prob, 'v': v, 'reconstruct': reconstruct, 'forward_predict': forward_prediction}
         conv_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/input_processor')
         params = {
             'a_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor') + conv_params,
             'c_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic') + conv_params,
+            'f_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict') + conv_params,
             'r_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct') + conv_params,
         }
 
@@ -383,8 +423,8 @@ class ACNet(object):
         with tf.variable_scope('actor'):
             self.l_a = self._process_inputs(self.s, w_init, n_hiddens['a'], share_processor=share_input_processor)
             if CONTINUOUS:
-                mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
+                mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='a_mu')
+                sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='a_sigma')
                 a_prob = (mu, sigma)
             else:
                 a_prob = tf.layers.dense(self.l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
@@ -393,20 +433,32 @@ class ACNet(object):
             self.l_c = self._process_inputs(self.s, w_init, n_hiddens['c'], share_processor=share_input_processor)
             v = tf.layers.dense(self.l_c, 1, kernel_initializer=w_init, name='v')  # state value
 
+        with tf.variable_scope('forward_predict'):
+            self.l_f = self._process_inputs(self.s, w_init, n_hiddens['f'], share_processor=share_input_processor)
+            fp_h = tf.layers.dense(self.l_f, n_hiddens['f'], tf.nn.relu, kernel_initializer=w_init, name='fp_h')
+            if self.forward_predict == 'vae':
+                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h, w_init)
+                fp_h = self.vae_z
+            if IMAGE_SHAPE is not None:
+                forward_prediction = self._build_deconv(fp_h, w_init, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+            else:
+                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='fp')
+
         with tf.variable_scope('reconstruct'):
             self.l_r = self._process_inputs(self.s, w_init, n_hiddens['r'], share_processor=share_input_processor)
             if self.reconstruct == 'vae':
-                self._vae_sample(self.l_r, w_init)
+                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r, w_init)
                 self.l_r = self.vae_z
             if IMAGE_SHAPE is not None:
                 reconstruct = self._build_deconv(self.l_r, w_init, reuse=False)
             else:
                 reconstruct = tf.layers.dense(self.l_r, N_S, kernel_initializer=w_init, name='r')
 
-        outputs = {'a_prob': a_prob, 'v': v, 'reconstruct': reconstruct}
+        outputs = {'a_prob': a_prob, 'v': v, 'reconstruct': reconstruct, 'forward_predict': forward_prediction}
         params = {
             'a_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor'),
             'c_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic'),
+            'f_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict'),
             'r_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct'),
         }
 
@@ -415,9 +467,11 @@ class ACNet(object):
     def _build_net(self, scope):
         w_init = tf.random_normal_initializer(0., .1)
 
-        n_hiddens = {'a': 200, 'c': 100, 'r': 100}
+        n_hiddens = {'a': 200, 'c': 100, 'r': 100, 'f': 100}
         if self.hard_share is not None:
             n_out = np.sum(list(n_hiddens.values()))
+            if not self.forward_predct:
+                n_out -= n_hiddens['f']
             if not self.reconstruct:
                 n_out -= n_hiddens['r']
             outputs, params = self._build_hard_share(scope, w_init, n_out=n_out, share_input_processor=True)
@@ -570,16 +624,29 @@ class ACNet(object):
 
     def update_global(self, feed_dict):  # run by a local
         ops = [self.c_loss, self.a_loss, self.t_exp_v, self.update_a_op, self.update_c_op]
+        end_idx = 4
+        if self.forward_predict:
+            ops.append(self.f_loss)
+            ops.append(self.update_f_op)
+            f_idx = end_idx + 1
+            end_idx = 6
         if self.reconstruct:
             ops.append(self.r_loss)
             ops.append(self.update_r_op)
+            r_idx = end_idx + 1
+            end_idx = 8
+
         results = SESS.run(ops, feed_dict)  # local grads applies to global net
         c_loss, a_loss, entropy = results[:3]
         if self.reconstruct:
-            r_loss = results[5]
+            r_loss = results[r_idx]
         else:
             r_loss = 0
-        return a_loss, c_loss, r_loss, entropy[0, 0]
+        if self.forward_predict:
+            f_loss = results[f_idx]
+        else:
+            f_loss = 0
+        return a_loss, c_loss, f_loss, r_loss, entropy[0, 0]
 
     def pull_global(self):  # run by a local
         ops = [self.pull_a_params_op, self.pull_c_params_op]
@@ -600,14 +667,15 @@ class ACNet(object):
         return action
 
 class Worker(object):
-    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_reconstruct=0.0, debug=False, stack=1, hold=1, reconstruct=False, batch_normalize=False, obs_diff=False):
+    def __init__(self, name, globalAC, hard_share=None, soft_sharing_coeff_actor=0.0, soft_sharing_coeff_critic=0.0, soft_sharing_coeff_reconstruct=0.0, gradient_clip_actor=0.0, gradient_clip_critic=0.0, gradient_clip_forward=0.0, gradient_clip_reconstruct=0.0, debug=False, stack=1, hold=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
         self.env = gym.make(GAME).unwrapped
         self.env = TimeLimit(self.env, max_episode_steps=MAX_EP_STEPS)
         self.name = name
-        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, soft_sharing_coeff_reconstruct=soft_sharing_coeff_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, stack=stack, reconstruct=reconstruct, batch_normalize=batch_normalize, obs_diff=obs_diff)
+        self.AC = ACNet(name, globalAC, hard_share=hard_share, soft_sharing_coeff_actor=soft_sharing_coeff_actor, soft_sharing_coeff_critic=soft_sharing_coeff_critic, soft_sharing_coeff_reconstruct=soft_sharing_coeff_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, stack=stack, forward_predict=forward_predict, reconstruct=reconstruct, batch_normalize=batch_normalize, obs_diff=obs_diff)
         self.debug = debug
         self.stack = stack
         self.hold = hold
+        self.forward_predict = forward_predict
         self.reconstruct = reconstruct
 
     def work(self):
@@ -693,7 +761,7 @@ class Worker(object):
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
                         print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss)
-                    c_loss, a_loss, r_loss, entropy = self.AC.update_global(feed_dict)
+                    c_loss, a_loss, f_loss, r_loss, entropy = self.AC.update_global(feed_dict)
 
                     buffer_s = buffer_s[-(self.stack-1):] if self.stack > 1 else []
                     buffer_a, buffer_r = [], []
@@ -712,8 +780,10 @@ class Worker(object):
                             GLOBAL_RUNNING_R.append(0.99 * GLOBAL_RUNNING_R[-1] + 0.01 * ep_r)
 
                     print(self.name, ' Ep: ', GLOBAL_EP, ' | Ep_r av: ', GLOBAL_RUNNING_R[-1], ' | Ep_r: ', ep_r, end='')
+                    if self.forward_predict:
+                        print('\tf_loss: ', f_loss, end='')
                     if self.reconstruct:
-                        print(' | r_loss: ', r_loss, end='')
+                        print('\tr_loss: ', r_loss, end='')
                     print('')
                     '''
                     log_lock.acquire()
@@ -749,12 +819,14 @@ def parse_args():
     parser.add_argument('--gradient_clip', type=float, default=0.0, help='Enables gradient clipping of actor and critic parameters with the specificied maximum gradient.')
     parser.add_argument('--gradient_clip_actor', type=float, default=0.0, help='Enables gradient clipping of actor parameters with the specificied maximum gradient.')
     parser.add_argument('--gradient_clip_critic', type=float, default=0.0, help='Enables gradient clipping of critic parameters with the specificied maximum gradient.')
+    parser.add_argument('--gradient_clip_forward', type=float, default=0.0, help='Enables gradient clipping of forward prediction parameters with the specificied maximum gradient.')
     parser.add_argument('--gradient_clip_reconstruct', type=float, default=0.0, help='Enables gradient clipping of reconstruction parameters with the specificied maximum gradient.')
     parser.add_argument('--debug', default=False, action='store_true', help='Enables debugging output.')
     parser.add_argument('--optimizer', default='adagrad', help='Which optimizer to use: rmsprop, adam, adagrad.')
     parser.add_argument('--lr', type=float, default=0.0, help='Sets the learning rate of the actor and critic.')
     parser.add_argument('--lr_a', type=float, default=0.001, help='Sets the learning rate of the actor.')
     parser.add_argument('--lr_c', type=float, default=0.001, help='Sets the learning rate of the critic.')
+    parser.add_argument('--lr_f', type=float, default=0.001, help='Sets the learning rate of the forward prediction.')
     parser.add_argument('--lr_r', type=float, default=0.001, help='Sets the learning rate of the reconstruction.')
     parser.add_argument('--log', default=False, action='store_true', help='Enables logging.')
     parser.add_argument('--max_global_ep', type=int, default=500, help='Sets the maximum number of episodes to be executed across all threads.')
@@ -768,6 +840,7 @@ def parse_args():
     parser.add_argument('--hold', type=int, default=1, help='Number of time steps to hold the control.')
     parser.add_argument('--obs_diff', default=False, action='store_true', help='Requires stack = 2 and uses a difference between the current and previous observation as the second input.')
     parser.add_argument('--tests', type=int, default=10, help='The number of times to simulate the system after training.')
+    parser.add_argument('--forward_predict', default=False, help='Enables forward predictions.')
     args = parser.parse_args()
 
     if args.max_ep_steps > 0:
@@ -807,18 +880,22 @@ def parse_args():
 
     gradient_clip_actor = args.gradient_clip_actor
     gradient_clip_critic = args.gradient_clip_critic
+    gradient_clip_forward = args.gradient_clip_forward
     gradient_clip_reconstruct = args.gradient_clip_reconstruct
     if args.gradient_clip > 0:
         gradient_clip_actor = args.gradient_clip
         gradient_clip_critic = args.gradient_clip
+        gradient_clip_forward = args.gradient_clip
         gradient_clip_reconstruct = args.gradient_clip
 
     lr_a = args.lr_a
     lr_c = args.lr_c
+    lr_f = args.lr_f
     lr_r = args.lr_r
     if args.lr > 0:
         lr_a = args.lr
         lr_c = args.lr
+        lr_f = args.lr
         lr_r = args.lr
 
     MAX_GLOBAL_EP = args.max_global_ep
@@ -865,6 +942,9 @@ def parse_args():
     if args.hold < 1:
         raise ValueError('Hold must be greater than or equal to one.')
 
+    if args.forward_predict not in [False, 'mse', 'vae']:
+        raise ValueError('forward_predict must be either \'mse' or 'vae\'.')
+
     if args.reconstruct not in [False, 'mse', 'vae']:
         raise ValueError('reconstruct must be either \'mse' or 'vae\'.')
 
@@ -881,12 +961,13 @@ def parse_args():
     print("hard_share: ", args.hard_share)
     print("soft_share_actor: ", soft_share_actor)
     print("soft_share_critic: ", soft_share_critic)
-    print("gradient_clip_actor: ", gradient_clip_actor)
-    print("gradient_clip_critic: ", gradient_clip_critic)
-    print("gradient_clip_reconstruct: ", gradient_clip_reconstruct)
-    print("gradient_clip_reconstruct: ", gradient_clip_reconstruct)
+    print("gradient clip. actor: ", gradient_clip_actor)
+    print("gradient clip, critic: ", gradient_clip_critic)
+    print("gradient clip, forward: ", gradient_clip_forward)
+    print("gradient clip reconstruct: ", gradient_clip_reconstruct)
     print("learning rate, actor: ", lr_a)
     print("learning rate, critic: ", lr_c)
+    print("learning rate, forward: ", lr_f)
     print("learning rate, reconstruct: ", lr_r)
     print("optimizer_class: ", optimizer_class)
     print("max_global_ep: ", MAX_GLOBAL_EP)
@@ -899,7 +980,7 @@ def parse_args():
     print("hold: ", args.hold)
     print("tests: ", args.tests)
 
-    return args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class
+    return args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct, gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class
 
 
 def run_tests(n_tests):
@@ -945,21 +1026,24 @@ def run_tests(n_tests):
 
     return ep_rs, buffer_s, buffer_a, buffer_r, reconstructions
 
+
 if __name__ == "__main__":
-    args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_reconstruct, lr_a, lr_c, lr_r, optimizer_class = parse_args()
+    args, env, soft_share_actor, soft_share_critic, soft_share_reconstruct,  gradient_clip_actor, gradient_clip_critic, gradient_clip_forward, gradient_clip_reconstruct, lr_a, lr_c, lr_f, lr_r, optimizer_class = parse_args()
     SESS = tf.Session()
 
     with tf.device("/cpu:0"):
         OPT_A = optimizer_class(lr_a, name='actor_opt')
         OPT_C = optimizer_class(lr_c, name='critic_opt')
+        if args.forward_predict:
+            OPT_F = optimizer_class(lr_f, name='forward_predict_opt')
         if args.reconstruct:
             OPT_R = optimizer_class(lr_r, name='reconstruct_opt')
-        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, stack=args.stack, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff)  # we only need its params
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE, hard_share=args.hard_share, stack=args.stack, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff)  # we only need its params
         workers = []
         # Create worker
         for i in range(N_WORKERS):
             i_name = 'W_%i' % i   # worker name
-            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, stack=args.stack, hold=args.hold, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff))
+            workers.append(Worker(i_name, GLOBAL_AC, hard_share=args.hard_share, soft_sharing_coeff_actor=soft_share_actor, soft_sharing_coeff_critic=soft_share_critic, soft_sharing_coeff_reconstruct=soft_share_reconstruct, gradient_clip_actor=gradient_clip_actor, gradient_clip_critic=gradient_clip_critic, gradient_clip_forward=gradient_clip_forward, gradient_clip_reconstruct=gradient_clip_reconstruct, debug=args.debug, stack=args.stack, hold=args.hold, forward_predict=args.forward_predict, reconstruct=args.reconstruct, batch_normalize=args.batch_normalize, obs_diff=args.obs_diff))
 
     COORD = tf.train.Coordinator()
     SESS.run(tf.global_variables_initializer())
