@@ -57,7 +57,7 @@ GLOBAL_EP = 0
 N_S = 0
 IMAGE_SHAPE = None
 N_A = 0
-N_VAE = 3
+N_VAE = 6
 N_FORWARD = 3
 A_BOUND = []
 CONTINUOUS = False
@@ -413,7 +413,7 @@ class ACNet(object):
         params = {}
         if 'actor' in TASKS:
             with tf.variable_scope('actor'):
-                self.l_a = self._process_inputs(self.s, n_hiddens['a'], share_processor=share_input_processor)
+                self.l_a = self._process_inputs(self.s, n_hiddens['actor'], share_processor=share_input_processor)
                 if CONTINUOUS:
                     mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='a_mu')
                     sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='a_sigma')
@@ -425,14 +425,14 @@ class ACNet(object):
 
         if 'critic' in TASKS:
             with tf.variable_scope('critic'):
-                self.l_c = self._process_inputs(self.s, n_hiddens['c'], share_processor=share_input_processor)
+                self.l_c = self._process_inputs(self.s, n_hiddens['critic'], share_processor=share_input_processor)
                 v = tf.layers.dense(self.l_c, 1, kernel_initializer=self.w_init, name='v')  # state value
                 outputs['critic'] = v
                 params['critic'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
 
         if 'forward_predict' in TASKS:
             with tf.variable_scope('forward_predict'):
-                self.l_f = self._process_inputs(self.s, n_hiddens['f'], share_processor=share_input_processor)
+                self.l_f = self._process_inputs(self.s, n_hiddens['foward_predict'], share_processor=share_input_processor)
                 fp_h = tf.layers.dense(self.l_f, n_hiddens['f'], tf.nn.relu, kernel_initializer=w_init, name='fp_h')
                 if FORWARD_PREDICT == 'vae':
                     self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
@@ -446,7 +446,7 @@ class ACNet(object):
 
         if 'reconstruct' in TASKS:
             with tf.variable_scope('reconstruct'):
-                self.l_r = self._process_inputs(self.s, n_hiddens['r'], share_processor=share_input_processor)
+                self.l_r = self._process_inputs(self.s, n_hiddens['reconstruct'], share_processor=share_input_processor)
                 if RECONSTRUCT == 'vae':
                     self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r)
                     self.l_r = self.vae_z
@@ -460,13 +460,16 @@ class ACNet(object):
         return outputs, params
 
     def _build_net(self, scope):
-        n_hiddens = {'a': 200, 'c': 100, 'r': 100, 'f': 100}
+        n_hiddens = {'actor': 200, 'critic': 100, 'reconstruct': 6, 'forward_predict': 100}
         if self.hard_share is not None:
+            n_out = np.sum([n_hiddens[task] for task in TASKS])
+            '''
             n_out = np.sum(list(n_hiddens.values()))
             if not self.forward_predct:
                 n_out -= n_hiddens['f']
             if not RECONSTRUCT:
                 n_out -= n_hiddens['r']
+            '''
             outputs, params = self._build_hard_share(scope, n_out=n_out, share_input_processor=True)
         else:
             outputs, params = self._build_soft_share(scope, n_hiddens=n_hiddens, share_input_processor=False)
