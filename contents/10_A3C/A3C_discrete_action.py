@@ -354,95 +354,108 @@ class ACNet(object):
         return z_mean, z_log_var, z
 
     def _build_hard_share(self, scope, n_out = 300, share_input_processor=False):
+        outputs = {}
+        params = {}
+
         with tf.variable_scope('input_processor'):
             l_p = self._process_inputs(self.s, self.w_init, n_out, share_processor=share_input_processor)
+        input_processor_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/input_processor')
 
-        with tf.variable_scope('actor'):
-            if CONTINUOUS:
-                mu = tf.layers.dense(l_p, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='mu')
-                sigma = tf.layers.dense(l_p, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='sigma')
-                a_prob = (mu, sigma)
-            else:
-                a_prob = tf.layers.dense(l_p, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
+        if 'actor' in TASKS:
+            with tf.variable_scope('actor'):
+                if CONTINUOUS:
+                    mu = tf.layers.dense(l_p, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='mu')
+                    sigma = tf.layers.dense(l_p, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='sigma')
+                    a_prob = (mu, sigma)
+                else:
+                    a_prob = tf.layers.dense(l_p, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
+            outputs['actor'] = a_prob
+            params['actor'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor') + input_processor_params
 
-        with tf.variable_scope('critic'):
-            v = tf.layers.dense(l_p, 1, kernel_initializer=self.w_init, name='v')  # state value
+        if 'critic' in TASKS:
+            with tf.variable_scope('critic'):
+                v = tf.layers.dense(l_p, 1, kernel_initializer=self.w_init, name='v')  # state value
+            outputs['critic'] = v
+            params['critic'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic') + input_processor_params
 
-        with tf.variable_scope('forward_predict'):
-            fp_h = l_p
-            fp_h = tf.layers.dense(fp_h, n_out, tf.nn.relu, kernel_initializer=self.w_init, name='fp')
-            if FORWARD_PREDICT == 'vae':
-                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
-                fp_h = self.fp_z
-            if IMAGE_SHAPE is not None:
-                forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
-            else:
-                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=self.w_init,  name='r')
+        if 'forward_predict' in TASKS:
+            with tf.variable_scope('forward_predict'):
+                fp_h = l_p
+                fp_h = tf.layers.dense(fp_h, n_out, tf.nn.relu, kernel_initializer=self.w_init, name='fp')
+                if FORWARD_PREDICT == 'vae':
+                    self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
+                    fp_h = self.fp_z
+                if IMAGE_SHAPE is not None:
+                    forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                else:
+                    forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=self.w_init,  name='r')
+            outputs['forward_prediction'] = forward_prediction
+            params['forward_predict'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict') + input_processor_params
 
-        with tf.variable_scope('reconstruct'):
-            r_p = l_p
-            if RECONSTRUCT == 'vae':
-                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(r_p)
-                r_p = self.vae_z
-            if IMAGE_SHAPE is not None:
-                reconstruct = self._build_deconv(r_p, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
-            else:
-                reconstruct = tf.layers.dense(r_p, N_S, kernel_initializer=w_init,  name='r')
-
-        outputs = {'actor': a_prob, 'critic': v, 'reconstruct': reconstruct, 'forward_predict': forward_prediction}
-        conv_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/input_processor')
-        params = {
-            'a_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor') + conv_params,
-            'c_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic') + conv_params,
-            'f_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict') + conv_params,
-            'r_params': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct') + conv_params,
-        }
-
+        if 'reconstruct' in TASKS:
+            with tf.variable_scope('reconstruct'):
+                r_p = l_p
+                if RECONSTRUCT == 'vae':
+                    self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(r_p)
+                    r_p = self.vae_z
+                if IMAGE_SHAPE is not None:
+                    reconstruct = self._build_deconv(r_p, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                else:
+                    reconstruct = tf.layers.dense(r_p, N_S, kernel_initializer=w_init,  name='r')
+            outputs['reconstruct'] = reconstruct
+            params['reconstruct'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct') + input_processor_params
+    
         return outputs, params
 
     def _build_soft_share(self, scope, n_hiddens, share_input_processor=False):
         # TODO DWEBB Store links to the different layers so they can be penalized with soft sharing schemes, e.g. via the regularization in the loss.
-        with tf.variable_scope('actor'):
-            self.l_a = self._process_inputs(self.s, n_hiddens['a'], share_processor=share_input_processor)
-            if CONTINUOUS:
-                mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='a_mu')
-                sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='a_sigma')
-                a_prob = (mu, sigma)
-            else:
-                a_prob = tf.layers.dense(self.l_a, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
+        outputs = {}
+        params = {}
+        if 'actor' in TASKS:
+            with tf.variable_scope('actor'):
+                self.l_a = self._process_inputs(self.s, n_hiddens['a'], share_processor=share_input_processor)
+                if CONTINUOUS:
+                    mu = tf.layers.dense(self.l_a, N_A, tf.nn.tanh, kernel_initializer=self.w_init, name='a_mu')
+                    sigma = tf.layers.dense(self.l_a, N_A, tf.nn.softplus, kernel_initializer=self.w_init, name='a_sigma')
+                    a_prob = (mu, sigma)
+                else:
+                    a_prob = tf.layers.dense(self.l_a, N_A, tf.nn.softmax, kernel_initializer=self.w_init, name='ap')
+                outputs['actor'] = a_prob
+                params['actor'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
 
-        with tf.variable_scope('critic'):
-            self.l_c = self._process_inputs(self.s, n_hiddens['c'], share_processor=share_input_processor)
-            v = tf.layers.dense(self.l_c, 1, kernel_initializer=self.w_init, name='v')  # state value
+        if 'critic' in TASKS:
+            with tf.variable_scope('critic'):
+                self.l_c = self._process_inputs(self.s, n_hiddens['c'], share_processor=share_input_processor)
+                v = tf.layers.dense(self.l_c, 1, kernel_initializer=self.w_init, name='v')  # state value
+                outputs['critic'] = v
+                params['critic'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
 
-        with tf.variable_scope('forward_predict'):
-            self.l_f = self._process_inputs(self.s, n_hiddens['f'], share_processor=share_input_processor)
-            fp_h = tf.layers.dense(self.l_f, n_hiddens['f'], tf.nn.relu, kernel_initializer=w_init, name='fp_h')
-            if FORWARD_PREDICT == 'vae':
-                self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
-                fp_h = self.vae_z
-            if IMAGE_SHAPE is not None:
-                forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
-            else:
-                forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='fp')
+        if 'forward_predict' in TASKS:
+            with tf.variable_scope('forward_predict'):
+                self.l_f = self._process_inputs(self.s, n_hiddens['f'], share_processor=share_input_processor)
+                fp_h = tf.layers.dense(self.l_f, n_hiddens['f'], tf.nn.relu, kernel_initializer=w_init, name='fp_h')
+                if FORWARD_PREDICT == 'vae':
+                    self.fp_z_mean, self.fp_z_log_var, self.fp_z = self._vae_sample(fp_h)
+                    fp_h = self.vae_z
+                if IMAGE_SHAPE is not None:
+                    forward_prediction = self._build_deconv(fp_h, reuse=False) # TODO DWEBB Address sharing of deconv parameters...
+                else:
+                    forward_prediction = tf.layers.dense(fp_h, N_S, kernel_initializer=w_init,  name='fp')
+                outputs['forward_predict'] = forward_prediction
+                params['forward_predict'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict')
 
-        with tf.variable_scope('reconstruct'):
-            self.l_r = self._process_inputs(self.s, n_hiddens['r'], share_processor=share_input_processor)
-            if RECONSTRUCT == 'vae':
-                self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r)
-                self.l_r = self.vae_z
-            if IMAGE_SHAPE is not None:
-                reconstruct = self._build_deconv(self.l_r, reuse=False)
-            else:
-                reconstruct = tf.layers.dense(self.l_r, N_S, kernel_initializer=self.w_init, name='r')
-
-        outputs = {'actor': a_prob, 'critic': v, 'reconstruct': reconstruct, 'forward_predict': forward_prediction}
-        params = {
-            'actor': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor'),
-            'critic': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic'),
-            'forward_predict': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/forward_predict'),
-            'reconstruct': tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct'),
-        }
+        if 'reconstruct' in TASKS:
+            with tf.variable_scope('reconstruct'):
+                self.l_r = self._process_inputs(self.s, n_hiddens['r'], share_processor=share_input_processor)
+                if RECONSTRUCT == 'vae':
+                    self.vae_z_mean, self.vae_z_log_var, self.vae_z = self._vae_sample(self.l_r)
+                    self.l_r = self.vae_z
+                if IMAGE_SHAPE is not None:
+                    reconstruct = self._build_deconv(self.l_r, reuse=False)
+                else:
+                    reconstruct = tf.layers.dense(self.l_r, N_S, kernel_initializer=self.w_init, name='r')
+                outputs['reconstruct'] = reconstruct
+                params['reconstruct'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct')
 
         return outputs, params
 
@@ -653,7 +666,7 @@ class ACNet(object):
         if 'actor' in TASKS:
             action = self._choose_action(s)
         elif CONTINUOUS:
-            action = ((A_BOUND[1] - A_BOUND[0])*np.random.rand(N_A) - A_BOUND[0])[0]
+            action = ((A_BOUND[1] - A_BOUND[0])*np.random.rand(N_A) + A_BOUND[0])[0]
         else:
             action = np.random.randint(N_A)
         return action
@@ -706,27 +719,32 @@ class Worker(object):
                     buffer_r.append(r)
 
                 if total_step % UPDATE_GLOBAL_ITER == 0 or done:   # update global and assign to local net
-                    if done:
-                        v_s_ = 0   # terminal
-                    else:
-                        obs_hist = buffer_s[-self.stack:]
-                        feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
-                        v_s_ = SESS.run(self.AC.outputs['critic'], feed_dict=feed_dict)[0, 0]
-
-                    buffer_v_target = []
-                    for r in buffer_r[::-1]:    # reverse buffer r
-                        v_s_ = r + GAMMA * v_s_
-                        buffer_v_target.append(v_s_)
-                    buffer_v_target.reverse()
-
-                    buffer_v_target = np.vstack(buffer_v_target)
-
-                    if CONTINUOUS:
-                        buffer_a = np.vstack(buffer_a)
-                    else:
-                        buffer_a = np.array(buffer_a)
-
                     feed_dict, _ = self.AC._build_obs_columns(buffer_s)
+
+                    if 'critic' in TASKS:
+                        if done:
+                            v_s_ = 0   # terminal
+                        else:
+                            obs_hist = buffer_s[-self.stack:]
+                            feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
+                            v_s_ = SESS.run(self.AC.outputs['critic'], feed_dict=feed_dict)[0, 0]
+
+                        buffer_v_target = []
+                        for r in buffer_r[::-1]:    # reverse buffer r
+                            v_s_ = r + GAMMA * v_s_
+                            buffer_v_target.append(v_s_)
+                        buffer_v_target.reverse()
+
+                        buffer_v_target = np.vstack(buffer_v_target)
+
+                        feed_dict[self.AC.v_target] = buffer_v_target
+
+                    if 'actor' in TASKS:
+                        if CONTINUOUS:
+                            buffer_a = np.vstack(buffer_a)
+                        else:
+                            buffer_a = np.array(buffer_a)
+                        feed_dict[self.AC.a_his] = buffer_a
                     '''
                     print(len(buffer_s))
                     print(len(buffer_a))
@@ -742,8 +760,6 @@ class Worker(object):
 
                     import ipdb; ipdb.set_trace()
                     '''
-                    if 'actor' in TASKS: feed_dict[self.AC.a_his] = buffer_a
-                    if 'critic' in TASKS: feed_dict[self.AC.v_target] = buffer_v_target
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
