@@ -76,7 +76,6 @@ def get_img(env, fn, *args):
     else:
         img = env.render(mode='rgb_array')
     img_lock.release()
-    #img = rgb2grey(img)
     img = resize(img, IMAGE_SHAPE)
     return img, results
 
@@ -106,6 +105,7 @@ def env_step_img(env, a):
     return img, results[1], results[2], results[3]
 
 env_reset_fn = env_reset_obs
+env_get_obs_fn = env_get_obs
 env_step_fn = env_step_obs
 
 def summarize_weights():
@@ -133,7 +133,7 @@ class ACNet(object):
         if scope == GLOBAL_NET_SCOPE:   # get global network
             with tf.variable_scope(scope):
                 self.s = input_placeholders()
-                #self.a_params, self.c_params, self.r_params = self._build_net(scope)
+
                 self.outputs, self.params = self._build_net(scope)
 
                 if 'actor' in TASKS and CONTINUOUS:
@@ -146,7 +146,7 @@ class ACNet(object):
                     normal_dist = tf.distributions.Normal(mu, sigma)
 
                     with tf.name_scope('choose_a'):  # use local params to choose action
-                        self.A = mu # TODO DWEBB Should we use the mean or sample?
+                        self.A = mu # TODO DWEBB Should we use the mean or sample? Using this works better because it doesn't inject noise.
                         #self.A = tf.clip_by_value(tf.squeeze(normal_dist.sample(1), axis=0), A_BOUND[0], A_BOUND[1])
 
         else:   # local net, calculate losses
@@ -596,8 +596,20 @@ class ACNet(object):
     def get_stats(self, feed_dict):
         return SESS.run([self.a_loss, self.c_loss, self.t_td, self.c_loss, self.t_log_prob, self.t_exp_v, self.t_entropy, self.t_exp_v2, self.a_loss, self.a_grads, self.c_grads], feed_dict)
 
+    def _build_obs_columns(self, buffer_s):
+        if IMAGE_SHAPE is not None:
+            buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
+        else:
+            buffer_s_ = copy.deepcopy(buffer_s)
+
+        obs_columns = [np.vstack(buffer_s_[idx:-(args.stack-(idx+1))]) for idx in range(args.stack-1)]
+        obs_columns.append(np.vstack(buffer_s_[args.stack-1:]))
+
+        feed_dict = {var: obs for var, obs in zip(self.s, obs_columns)}
+
+        return feed_dict, buffer_s_
+
     def update_global(self, feed_dict):  # run by a local
-        # TODO DWEBB Make this compliant with new tasks control
         stats = [self.t_exp_v]
         offset = len(stats)
         update_ops = []
@@ -612,48 +624,23 @@ class ACNet(object):
             output_stats[key] = results[idx]
         output_stats['exp_v'] = output_stats['exp_v'][0, 0]
         return output_stats
-        '''            
-        ops = [self.c_loss, self.a_loss, self.t_exp_v, self.update_a_op, self.update_c_op]
-        end_idx = 4
-        if FORWARD_PREDICT:
-            ops.append(self.f_loss)
-            ops.append(self.update_f_op)
-            f_idx = end_idx + 1
-            end_idx = 6
-        if RECONSTRUCT:
-            ops.append(self.r_loss)
-            ops.append(self.update_r_op)
-            r_idx = end_idx + 1
-            end_idx = 8
-
-        results = SESS.run(ops, feed_dict)  # local grads applies to global net
-        c_loss, a_loss, entropy = results[:3]
-        if RECONSTRUCT:
-            r_loss = results[r_idx]
-        else:
-            r_loss = 0
-        if FORWARD_PREDICT:
-            f_loss = results[f_idx]
-        else:
-            f_loss = 0
-        return a_loss, c_loss, f_loss, r_loss, entropy[0, 0]
-        '''
-
 
     def pull_global(self):  # run by a local
         SESS.run(tuple(self.pull_params_op.values()))
 
     def choose_action(self, s):  # run by a local
-        temp = [obs[np.newaxis, :] for obs in s]
-        feed_dict = {var: obs for var, obs in zip(self.s, temp)}
+        feed_dict, _ = self._build_obs_columns(s)
         if CONTINUOUS:
             action = np.squeeze(SESS.run(self.A, feed_dict=feed_dict)[0])
-            #action = np.squeeze(SESS.run(self.A, feed_dict=feed_dict))
         else:
             prob_weights = SESS.run(self.outputs['actor'], feed_dict=feed_dict)
             action = np.random.choice(range(prob_weights.shape[1]),
                                       p=prob_weights.ravel())  # select action w.r.t the actions prob
         return action
+
+    def reconstruct(self, buffer_s):
+        feed_dict, buffer_s_ = self._build_obs_columns(buffer_s)
+        return SESS.run(self.outputs['reconstruct'], feed_dict=feed_dict), buffer_s_
 
 class Worker(object):
     def __init__(self, name, w_init, globalAC, soft_sharing_coeff, gradient_clip, hard_share=None, debug=False, stack=1, hold=1, batch_normalize=False, obs_diff=False):
@@ -667,7 +654,7 @@ class Worker(object):
 
     def work(self):
         global GLOBAL_RUNNING_R, GLOBAL_R, GLOBAL_EP, MAX_GLOBAL_EP
-        global env_reset_fn, env_step_fn
+        global env_reset_fn, env_get_obs_fn, env_step_fn
 
         total_step = 1
         buffer_s, buffer_a, buffer_r = [], [], []
@@ -712,20 +699,14 @@ class Worker(object):
                         buffer_v_target.append(v_s_)
                     buffer_v_target.reverse()
 
-                    if IMAGE_SHAPE is not None:
-                        buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
-                    else:
-                        buffer_s_ = copy.deepcopy(buffer_s)
+                    buffer_v_target = np.vstack(buffer_v_target)
 
                     if CONTINUOUS:
                         buffer_a = np.vstack(buffer_a)
                     else:
                         buffer_a = np.array(buffer_a)
 
-                    buffer_v_target = np.vstack(buffer_v_target)
-
-                    obs_columns = [np.vstack(buffer_s_[idx:-(self.stack-(idx+1))]) for idx in range(self.stack-1)]
-                    obs_columns.append(np.vstack(buffer_s_[self.stack-1:]))
+                    feed_dict, _ = self.AC._build_obs_columns(buffer_s)
                     '''
                     print(len(buffer_s))
                     print(len(buffer_a))
@@ -741,7 +722,7 @@ class Worker(object):
 
                     import ipdb; ipdb.set_trace()
                     '''
-                    feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
+                    #feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
                     feed_dict[self.AC.a_his] = buffer_a
                     feed_dict[self.AC.v_target] = buffer_v_target
                     if self.debug and self.name == 'W_0':
@@ -767,7 +748,7 @@ class Worker(object):
                         else:
                             GLOBAL_RUNNING_R.append(0.99 * GLOBAL_RUNNING_R[-1] + 0.01 * ep_r)
 
-                    print(self.name, ' Ep: ', GLOBAL_EP, ' | Ep_r av: ', GLOBAL_RUNNING_R[-1], ' | Ep_r: ', ep_r, end='')
+                    print(self.name, '\tep: ', GLOBAL_EP, '\tep_r_av: ', GLOBAL_RUNNING_R[-1], '\tep_r: ', ep_r, end='')
                     for name, update_output in update_outputs.items():
                         print('\t', name, ': ', update_output, end='')
                     '''
@@ -798,7 +779,7 @@ class Worker(object):
 
 def parse_args():
     global TASKS, GAME, A_BOUND, ENTROPY_BETA, MAX_EP_STEPS, UPDATE_GLOBAL_ITER, MAX_GLOBAL_EP, N_S, N_A, IMAGE_SHAPE, CONTINUOUS, N_WORKERS, FORWARD_PREDICT
-    global env_reset_fn, env_step_fn
+    global env_reset_fn, env_get_obs_fn, env_step_fn
 
     initializers = ['orthogonal', 'standard_normal']
 
@@ -946,9 +927,11 @@ def parse_args():
         IMAGE_SHAPE = tuple(map(int, args.image_shape[0].split(','))) + (3,) # Add the number of channels which will always be 3 for RGB images
 
         env_reset_fn = env_reset_img
+        env_get_obs_fn = env_get_img
         env_step_fn = env_step_img
     else:
         env_reset_fn = env_reset_obs
+        env_get_obs_fn = env_get_obs
         env_step_fn = env_step_obs
 
     if args.hold < 1:
@@ -1016,10 +999,7 @@ def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
         s, _ = env_reset_fn(env)
         if not randomize_start:
             env.env.state = start_state
-            if IMAGE_SHAPE is not None:
-                s, _ = env_get_img(env)
-            else:
-                s = env.env._get_obs()
+            s = env_get_obs_fn(env)
 
         env.render()
         buffer_s = [s]*(args.stack-1)
@@ -1041,15 +1021,14 @@ def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
         ep_rs.append(ep_r)
 
     reconstructions = []
-    if args.reconstruct:
-        if IMAGE_SHAPE is not None:
-            buffer_s = [obs[np.newaxis, :] for obs in buffer_s]
-        buffer_s_ = np.vstack(buffer_s)
-        reconstructions = SESS.run(GLOBAL_AC.reconstruction, feed_dict={GLOBAL_AC.s[0]: buffer_s_})
+    if 'reconstruct' in TASKS:
+        reconstructions, buffer_s_ = GLOBAL_AC.reconstruct(buffer_s)
+
         print('Mean reconstruction error: ',np.mean( buffer_s_ - reconstructions))
-        
-        plt.imshow(np.squeeze(reconstructions[0]))
-        plt.show()
+
+        if IMAGE_SHAPE is not None:
+            plt.imshow(np.squeeze(reconstructions[0]))
+            plt.show()
         
     return ep_rs, buffer_s, buffer_a, buffer_r, reconstructions
 
@@ -1110,4 +1089,4 @@ if __name__ == "__main__":
     else:
         plt.show()
 
-        #ep_rs, buffer_s, buffer_a, buffer_r, reconstructions = run_tests(args.tests)
+        ep_rs, buffer_s, buffer_a, buffer_r, reconstructions = run_tests(args.tests)
