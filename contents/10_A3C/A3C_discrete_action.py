@@ -10,9 +10,8 @@ tensorflow 1.0
 gym 0.8.0
 
 TODO
-- Add VAE loss to reconstructions
-- Add cos activation
 - Add forward predictions
+- Add cos activation
 - Add evaluation at every X epochs
 """
 
@@ -186,9 +185,12 @@ class ACNet(object):
                             log_prob = normal_dist.log_prob(self.a_his)
                         else:
                             log_prob = tf.reduce_sum(tf.log(self.outputs['actor']) * tf.one_hot(self.a_his, N_A, dtype=tf.float32), axis=1, keep_dims=True)
-    
-                        exp_v = log_prob * tf.stop_gradient(td)
-    
+
+                        if 'critic' in TASKS:
+                            exp_v = log_prob * tf.stop_gradient(td)
+                        else:
+                            exp_v = log_prob # TODOD DWEBB is this the correct way to remove the ritic?
+
                         entropy_beta = ENTROPY_BETA
                         if CONTINUOUS:
                             entropy = normal_dist.entropy()  # encourage exploration
@@ -229,9 +231,13 @@ class ACNet(object):
                             x = KK.flatten(self.s[0])
                             x_decoded_mean_squash_flat = KK.flatten(self.outputs['reconstruct'])
 
-                            img_rows = IMAGE_SHAPE[0]
-                            img_cols = IMAGE_SHAPE[0]
-                            xent_loss = img_rows * img_cols * metrics.binary_crossentropy(x, x_decoded_mean_squash_flat)
+                            if IMAGE_SHAPE is not None:
+                                img_rows = IMAGE_SHAPE[0]
+                                img_cols = IMAGE_SHAPE[0]
+                                shape_coeff = img_rows*img_cols
+                            else:
+                                shape_coeff = N_S
+                            xent_loss = shape_coeff * metrics.binary_crossentropy(x, x_decoded_mean_squash_flat)
                             kl_loss = - 0.5 * KK.mean(1 + self.vae_z_log_var - KK.square(self.vae_z_mean) - KK.exp(self.vae_z_log_var), axis=-1)
 
                             self.losses['reconstruct'] = 10*KK.mean(xent_loss + kl_loss)
@@ -610,10 +616,13 @@ class ACNet(object):
         return feed_dict, buffer_s_
 
     def update_global(self, feed_dict):  # run by a local
-        stats = [self.t_exp_v]
+        results_map = {}
+        stats = []
+        if hasattr(self, 't_exp_v'):
+            results_map['exp_v'] = 0
+            stats.append(self.t_exp_v)
         offset = len(stats)
         update_ops = []
-        results_map = {'exp_v': 0}
         for idx, task in enumerate(TASKS):
             stats.append(self.losses[task])
             update_ops.append(self.update_op[task])
@@ -622,13 +631,15 @@ class ACNet(object):
         output_stats = {}
         for key, idx in results_map.items():
             output_stats[key] = results[idx]
-        output_stats['exp_v'] = output_stats['exp_v'][0, 0]
+
+        if 'exp_v' in output_stats:
+            output_stats['exp_v'] = output_stats['exp_v'][0, 0]
         return output_stats
 
     def pull_global(self):  # run by a local
         SESS.run(tuple(self.pull_params_op.values()))
 
-    def choose_action(self, s):  # run by a local
+    def _choose_action(self, s):  # run by a local
         feed_dict, _ = self._build_obs_columns(s)
         if CONTINUOUS:
             action = np.squeeze(SESS.run(self.A, feed_dict=feed_dict)[0])
@@ -638,7 +649,16 @@ class ACNet(object):
                                       p=prob_weights.ravel())  # select action w.r.t the actions prob
         return action
 
-    def reconstruct(self, buffer_s):
+    def choose_action(self, s):  # run by a local
+        if 'actor' in TASKS:
+            action = self._choose_action(s)
+        elif CONTINUOUS:
+            action = ((A_BOUND[1] - A_BOUND[0])*np.random.rand(N_A) - A_BOUND[0])[0]
+        else:
+            action = np.random.randint(N_A)
+        return action
+
+    def reconstruct(self, buffer_s):  # run by a local
         feed_dict, buffer_s_ = self._build_obs_columns(buffer_s)
         return SESS.run(self.outputs['reconstruct'], feed_dict=feed_dict), buffer_s_
 
@@ -722,9 +742,8 @@ class Worker(object):
 
                     import ipdb; ipdb.set_trace()
                     '''
-                    #feed_dict = {var: obs for var, obs in zip(self.AC.s, obs_columns)}
-                    feed_dict[self.AC.a_his] = buffer_a
-                    feed_dict[self.AC.v_target] = buffer_v_target
+                    if 'actor' in TASKS: feed_dict[self.AC.a_his] = buffer_a
+                    if 'critic' in TASKS: feed_dict[self.AC.v_target] = buffer_v_target
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
