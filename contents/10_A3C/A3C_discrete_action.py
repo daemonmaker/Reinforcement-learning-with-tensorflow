@@ -27,7 +27,6 @@ import matplotlib.pyplot as plt
 
 from gym.wrappers.time_limit import TimeLimit
 import argparse
-#from baselines import logger
 from skimage.color import rgb2grey
 from skimage.transform import resize
 import copy
@@ -299,46 +298,6 @@ class ACNet(object):
         processed_inputs = tf.concat(processed_inputs, -1)
         return processed_inputs
 
-    def _build_conv(self, inputs, w_init, reuse=False):
-        with tf.variable_scope('convs'):
-            if self.obs_diff and self.stack == 2:
-                diff = inputs[1] - inputs[0]
-                concat_inputs = tf.concat([inputs[1], diff], -1)
-            else:
-                concat_inputs = tf.concat(inputs, -1)
-
-            conv1 = tf.layers.conv2d(self._batch_normalize(concat_inputs), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c1')
-            pool1 = tf.layers.max_pooling2d(conv1, 2, 1, reuse=reuse, name='p1')
-            conv2 = tf.layers.conv2d(self._batch_normalize(pool1), 16, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c2')
-            pool2 = tf.layers.max_pooling2d(conv2, 2, 1, reuse=reuse, name='p2')
-            conv3 = tf.layers.conv2d(self._batch_normalize(pool2), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c3')
-            conv4 = tf.layers.conv2d(conv3, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c4')
-            pool4 = tf.layers.max_pooling2d(conv4, 2, 1, reuse=reuse, name='p3')
-            conv5 = tf.layers.conv2d(self._batch_normalize(pool4), 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c5')
-            conv6 = tf.layers.conv2d(conv5, 32, 3, strides=(1,1), padding='same', activation=tf.nn.relu, kernel_initializer=w_init, bias_initializer=tf.constant_initializer(0.1), reuse=reuse, name='c6')
-            self.flattened_conv = tf.layers.flatten(conv6, name='flattened_conv')
-            fc = tf.layers.dense(self.flattened_conv, 512, tf.nn.relu6, kernel_initializer=w_init, reuse=reuse, name='fc')
-            inputs = tf.layers.dense(fc, 512, tf.nn.relu6, kernel_initializer=w_init, reuse=reuse, name='inputs')
-            '''
-            # TODO DWEBB add stack support here
-            diff = inputs[1] - inputs[0]
-            inputs = tf.concat([inputs[1], diff], -1)
-            conv1 = tf.layers.conv2d(inputs, 64, 8, name='c1')
-            #pool1 = tf.layers.max_pooling2d(conv1, 5, 1, name='p1')
-            relu1 = tf.nn.relu(conv1, name='relu1')
-            conv2 = tf.layers.conv2d(relu1, 32, 8, name='c2')
-            pool2 = tf.layers.max_pooling2d(conv2, 5, 1, name='p2')
-            relu2 = tf.nn.relu(pool2, name='relu2')
-            conv3 = tf.layers.conv2d(relu2, 32, 5, name='c3')
-            pool3 = tf.layers.max_pooling2d(conv3, 5, 1, name='p3')
-            relu3 = tf.nn.relu(pool3, name='relu3')
-            conv4 = tf.layers.conv2d(relu3, 32, 5, name='c4')
-            pool4 = tf.layers.max_pooling2d(conv4, 5, 1, name='p4')
-            relu4 = tf.nn.relu(pool4, name='relu4')
-            inputs = tf.layers.flatten(relu4, name='p3')
-            '''
-        return inputs
-
     def _build_deconv(self, inputs, reuse=False):
         with tf.variable_scope('deconvs'):
             # TODO DWEBB fix these magic numbers!
@@ -406,7 +365,7 @@ class ACNet(object):
                     reconstruct = tf.layers.dense(r_p, N_S, kernel_initializer=w_init,  name='r')
             outputs['reconstruct'] = reconstruct
             params['reconstruct'] = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct') + input_processor_params
-    
+
         return outputs, params
 
     def _build_soft_share(self, scope, n_hiddens, share_input_processor=False):
@@ -471,145 +430,6 @@ class ACNet(object):
 
         return outputs, params
 
-    def _build_net_old(self, scope):
-        w_init = tf.random_normal_initializer(0., .1)
-        inputs = self.s
-        s_params = []
-        reconstruct = ''
-        if self.hard_share is not None:
-            if IMAGE_SHAPE is not None:
-                inputs = self._build_conv(inputs, w_init)
-            else:
-                inputs = tf.concat(inputs, 1)
-
-            if self.hard_share == 'equal_params':
-                with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(inputs, 71, tf.nn.relu6, kernel_initializer=w_init, name='ls')
-                with tf.variable_scope('actor'):
-                    l_a = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                    if CONTINUOUS:
-                        mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                        sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
-                        a_prob = (mu, sigma)
-                    else:
-                        a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
-                with tf.variable_scope('critic'):
-                    l_c = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                    v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
-                if RECONSTRUCT:
-                    with tf.variable_scope('reconstruct'):
-                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
-                        if IMAGE_SHAPE is not None:
-                            reconstruct = self._build_deconv(l_r, w_init)
-                        else:
-                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
-            elif False:
-                with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='ls')
-                with tf.variable_scope('actor'):
-                    l_a = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                    if CONTINUOUS:
-                        mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                        sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
-                        a_prob = (mu, sigma)
-                    else:
-                        a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
-                with tf.variable_scope('critic'):
-                    l_c = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                    v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
-                if RECONSTRUCT:
-                    with tf.variable_scope('reconstruct'):
-                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
-                        if IMAGE_SHAPE is not None:
-                            reconstruct = self._build_deconv(l_r, w_init)
-                        else:
-                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
-            else:
-                with tf.variable_scope('shared'):
-                    l_s = tf.layers.dense(inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='ls')
-                with tf.variable_scope('actor'):
-                    l_a = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                    if CONTINUOUS:
-                        mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                        sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
-                        a_prob = (mu, sigma)
-                    else:
-                        a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
-                with tf.variable_scope('critic'):
-                    l_c = tf.layers.dense(l_s, 10, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                    v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
-                if RECONSTRUCT:
-                    with tf.variable_scope('reconstruct'):
-                        l_r = tf.layers.dense(l_s, 16, tf.nn.relu6, kernel_initializer=w_init, name='lr')
-                        if IMAGE_SHAPE is not None:
-                            reconstruct = self._build_deconv(l_r, w_init)
-                        else:
-                            reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')  # state value
-
-            s_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/shared')
-        else:
-            if IMAGE_SHAPE is not None:
-                concat_inputs = self._build_conv(inputs, w_init)
-            else:
-                concat_inputs = tf.concat(inputs, 1)
-
-            with tf.variable_scope('actor'):
-                '''
-                if IMAGE_SHAPE is not None:
-                    concat_inputs = self._build_conv(inputs, w_init)
-                else:
-                    concat_inputs = tf.concat(inputs, 1)
-                '''
-                l_a = tf.layers.dense(concat_inputs, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
-                #l_a = tf.layers.dense(l_a, 100, tf.nn.relu6, kernel_initializer=w_init, name='la1')
-                self.l_a = l_a
-                if CONTINUOUS:
-                    mu = tf.layers.dense(l_a, N_A, tf.nn.tanh, kernel_initializer=w_init, name='mu')
-                    sigma = tf.layers.dense(l_a, N_A, tf.nn.softplus, kernel_initializer=w_init, name='sigma')
-                    a_prob = (mu, sigma)
-                else:
-                    a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
-            with tf.variable_scope('critic'):
-                '''
-                if IMAGE_SHAPE is not None:
-                    concat_inputs = self._build_conv(inputs, w_init)
-                else:
-                    concat_inputs = tf.concat(inputs, 1)
-                '''
-                l_c = tf.layers.dense(concat_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
-                #l_c = tf.layers.dense(l_c, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc1')
-                self.l_c = l_c
-                v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
-            if RECONSTRUCT:
-                with tf.variable_scope('reconstruct'):
-                    '''
-                    if IMAGE_SHAPE is not None:
-                        concat_inputs = self._build_conv(inputs, w_init)
-                    else:
-                        concat_inputs = tf.concat(inputs, 1)
-                    '''
-                    l_r = tf.layers.dense(concat_inputs, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr')
-                    l_r = tf.layers.dense(l_r, 100, tf.nn.relu6, kernel_initializer=w_init, name='lr1')
-                    self.l_r = l_r
-                    if IMAGE_SHAPE is not None:
-                        reconstruct = self._build_deconv(l_r, w_init)
-                    else:
-                        reconstruct = tf.layers.dense(l_r, N_S, kernel_initializer=w_init, name='r')
-
-        a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
-        c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
-        if IMAGE_SHAPE is not None:
-            i_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/convs')
-            if RECONSTRUCT:
-                i_params += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/deconvs')
-        else:
-            i_params = []
-        if RECONSTRUCT:
-            r_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/reconstruct')
-        else:
-            r_params = []
-        return a_prob, v, reconstruct, a_params + s_params + i_params, c_params + s_params + i_params, r_params + s_params + i_params
-
     def get_stats(self, feed_dict):
         return SESS.run([self.a_loss, self.c_loss, self.t_td, self.c_loss, self.t_log_prob, self.t_exp_v, self.t_entropy, self.t_exp_v2, self.a_loss, self.a_grads, self.c_grads], feed_dict)
 
@@ -619,7 +439,7 @@ class ACNet(object):
 
         feed_dict = {var: obs for var, obs in zip(self.s, obs_columns)}
 
-        return feed_dict, (0,)
+        return feed_dict
 
     def update_global(self, feed_dict):  # run by a local
         results_map = {}
@@ -646,7 +466,7 @@ class ACNet(object):
         SESS.run(tuple(self.pull_params_op.values()))
 
     def _choose_action(self, s):  # run by a local
-        feed_dict, _ = self._build_obs_columns(s)
+        feed_dict = self._build_obs_columns(s)
         if CONTINUOUS:
             action = np.squeeze(SESS.run(self.A, feed_dict=feed_dict)[0])
         else:
@@ -665,8 +485,8 @@ class ACNet(object):
         return action
 
     def reconstruct(self, buffer_s):  # run by a local
-        feed_dict, buffer_s_ = self._build_obs_columns(buffer_s)
-        return SESS.run(self.outputs['reconstruct'], feed_dict=feed_dict), buffer_s_
+        feed_dict = self._build_obs_columns(buffer_s)
+        return SESS.run(self.outputs['reconstruct'], feed_dict=feed_dict)
 
 class Worker(object):
     def __init__(self, name, w_init, globalAC, soft_sharing_coeff, gradient_clip, hard_share=None, debug=False, stack=1, hold=1, batch_normalize=False, obs_diff=False):
@@ -725,7 +545,7 @@ class Worker(object):
 
                 if total_step % UPDATE_GLOBAL_ITER == 0 or done: # or np.random.rand() > 0.99:   # update global and assign to local net
                     #print("Updating {} {}...".format(ep_t, total_step))
-                    feed_dict, _ = self.AC._build_obs_columns(self.buffer_s[:buffer_idx+self.stack])
+                    feed_dict = self.AC._build_obs_columns(self.buffer_s[:buffer_idx+self.stack])
 
                     if 'critic' in TASKS:
                         if done:
@@ -788,20 +608,6 @@ class Worker(object):
                     for name, update_output in update_outputs.items():
                         print('\t', name, ': ', update_output, end='')
                     print('')
-                    '''
-                    log_lock.acquire()
-                    logger.record_tabular("global_ep", GLOBAL_EP)
-                    logger.record_tabular("name", self.name)
-                    logger.record_tabular("ep_r", ep_r)
-                    logger.record_tabular("ep_r_weighted", GLOBAL_RUNNING_R[-1])
-                    logger.record_tabular("c_loss", c_loss)
-                    logger.record_tabular("a_loss", a_loss)
-                    if RECONSTRUCT:
-                        logger.record_tabular("r_loss", r_loss)
-                    logger.record_tabular("entropy", entropy)
-                    logger.dump_tabular()
-                    log_lock.release()
-                    '''
 
                     GLOBAL_EP += 1
                     break
@@ -1052,9 +858,10 @@ def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
 
     reconstructions = []
     if 'reconstruct' in TASKS:
-        reconstructions, buffer_s_ = GLOBAL_AC.reconstruct(buffer_s)
+        reconstructions = GLOBAL_AC.reconstruct(buffer_s)
+        buffer_s_ = np.vstack([buffer_s_[np.newaxis,:] for buffer_s_ in buffer_s])[:-1]
 
-        print('Mean reconstruction error: ',np.mean( buffer_s - reconstructions))
+        print('Mean reconstruction error: ',np.mean(buffer_s_ - reconstructions))
 
         if IMAGE_SHAPE is not None:
             plt.imshow(np.squeeze(reconstructions[0]))
