@@ -13,6 +13,7 @@ TODO
 - Add forward predictions
 - Add cos activation
 - Add evaluation at every X epochs
+- Replace logger
 """
 
 import multiprocessing
@@ -117,6 +118,7 @@ class ACNet(object):
     def __init__(self, scope, w_init, soft_sharing_coeff, gradient_clip, globalAC=None, hard_share=None, stack=1, forward_predict=False, reconstruct=False, batch_normalize=False, obs_diff=False):
         self.scope = scope
         self.w_init = w_init
+        self.gradient_clip = gradient_clip
         self.hard_share = hard_share
         self.stack = stack
         self.batch_normalize = batch_normalize
@@ -463,13 +465,6 @@ class ACNet(object):
         n_hiddens = {'actor': 200, 'critic': 100, 'reconstruct': 6, 'forward_predict': 100}
         if self.hard_share is not None:
             n_out = np.sum([n_hiddens[task] for task in TASKS])
-            '''
-            n_out = np.sum(list(n_hiddens.values()))
-            if not self.forward_predct:
-                n_out -= n_hiddens['f']
-            if not RECONSTRUCT:
-                n_out -= n_hiddens['r']
-            '''
             outputs, params = self._build_hard_share(scope, n_out=n_out, share_input_processor=True)
         else:
             outputs, params = self._build_soft_share(scope, n_hiddens=n_hiddens, share_input_processor=False)
@@ -619,17 +614,12 @@ class ACNet(object):
         return SESS.run([self.a_loss, self.c_loss, self.t_td, self.c_loss, self.t_log_prob, self.t_exp_v, self.t_entropy, self.t_exp_v2, self.a_loss, self.a_grads, self.c_grads], feed_dict)
 
     def _build_obs_columns(self, buffer_s):
-        if IMAGE_SHAPE is not None:
-            buffer_s_ = [buffer_s_[np.newaxis, :] for buffer_s_ in buffer_s]
-        else:
-            buffer_s_ = copy.deepcopy(buffer_s)
-
-        obs_columns = [np.vstack(buffer_s_[idx:-(args.stack-(idx+1))]) for idx in range(args.stack-1)]
-        obs_columns.append(np.vstack(buffer_s_[args.stack-1:]))
+        obs_columns = [buffer_s[idx:-(self.stack-(idx+1))] for idx in range(self.stack-1)]
+        obs_columns.append(buffer_s[self.stack-1:])
 
         feed_dict = {var: obs for var, obs in zip(self.s, obs_columns)}
 
-        return feed_dict, buffer_s_
+        return feed_dict, (0,)
 
     def update_global(self, feed_dict):  # run by a local
         results_map = {}
@@ -688,6 +678,14 @@ class Worker(object):
         self.stack = stack
         self.hold = hold
 
+        if IMAGE_SHAPE is not None:
+            self.buffer_s = np.zeros((UPDATE_GLOBAL_ITER + self.stack - 1, ) + IMAGE_SHAPE)
+        else:
+            self.buffer_s = np.zeros((UPDATE_GLOBAL_ITER + self.stack - 1, N_S))
+        self.buffer_a = np.zeros((UPDATE_GLOBAL_ITER, N_A))
+        self.buffer_r = np.zeros((UPDATE_GLOBAL_ITER, 1))
+        self.buffer_v_target = np.zeros((UPDATE_GLOBAL_ITER, 1))
+
     def work(self):
         global GLOBAL_RUNNING_R, GLOBAL_R, GLOBAL_EP, MAX_GLOBAL_EP
         global env_reset_fn, env_get_obs_fn, env_step_fn
@@ -698,13 +696,15 @@ class Worker(object):
             s, _ = env_reset_fn(self.env)
 
             buffer_s = [s]*(self.stack-1)
+            buffer_idx = 0
+            for s_idx in range(self.stack-1):
+                self.buffer_s[s_idx] = s
             ep_r = 0
             action_count = 0
             for ep_t in range(MAX_EP_STEPS):
-            #while True:
-                buffer_s.append(s)
+                self.buffer_s[buffer_idx+self.stack-1] = s
                 if action_count % self.hold == 0:
-                    a = self.AC.choose_action(buffer_s[-self.stack:])
+                    a = self.AC.choose_action(self.buffer_s[buffer_idx:buffer_idx+self.stack])
                 #if self.name == 'W_0':
                 #    print('ep_r: ', ep_r, '\taction: ', a)
                 action_count += 1
@@ -715,38 +715,34 @@ class Worker(object):
                 elif done: r = -2000 #-5
 
                 ep_r += r
-                buffer_a.append(a)
+                self.buffer_a[buffer_idx] = a
                 if CONTINUOUS:
                     buffer_r.append((r+8)/8)
+                    self.buffer_r[buffer_idx] = (r+8)/8
                 else:
                     buffer_r.append(r)
+                    self.buffer_r[buffer_idx] = r
 
-                if total_step % UPDATE_GLOBAL_ITER == 0 or done:   # update global and assign to local net
-                    feed_dict, _ = self.AC._build_obs_columns(buffer_s)
+                if total_step % UPDATE_GLOBAL_ITER == 0 or done: # or np.random.rand() > 0.99:   # update global and assign to local net
+                    #print("Updating {} {}...".format(ep_t, total_step))
+                    feed_dict, _ = self.AC._build_obs_columns(self.buffer_s[:buffer_idx+self.stack])
 
                     if 'critic' in TASKS:
                         if done:
                             v_s_ = 0   # terminal
                         else:
-                            obs_hist = buffer_s[-self.stack:]
+                            obs_hist = self.buffer_s[buffer_idx:buffer_idx+self.stack]
                             obs_feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
                             v_s_ = SESS.run(self.AC.outputs['critic'], feed_dict=obs_feed_dict)[0, 0]
 
-                        buffer_v_target = []
-                        for r in buffer_r[::-1]:    # reverse buffer r
+                        for idx, r in enumerate(self.buffer_r[buffer_idx::-1]):    # reverse buffer r
                             v_s_ = r + GAMMA * v_s_
-                            buffer_v_target.append(v_s_)
-                        buffer_v_target.reverse()
+                            self.buffer_v_target[idx] = v_s_
 
-                        buffer_v_target = np.vstack(buffer_v_target)
-                        feed_dict[self.AC.v_target] = buffer_v_target
+                        feed_dict[self.AC.v_target] = np.flip(self.buffer_v_target[:buffer_idx+1], 0)
 
                     if 'actor' in TASKS:
-                        if CONTINUOUS:
-                            buffer_a_ = np.vstack(buffer_a)
-                        else:
-                            buffer_a_ = np.array(buffer_a)
-                        feed_dict[self.AC.a_his] = buffer_a_
+                        feed_dict[self.AC.a_his] = self.buffer_a[:buffer_idx+1]
 
                     '''
                     print(len(buffer_s))
@@ -768,15 +764,16 @@ class Worker(object):
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
                         print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss)
-                    #c_loss, a_loss, f_loss, r_loss, entropy = self.AC.update_global(feed_dict)
                     update_outputs = self.AC.update_global(feed_dict)
 
                     buffer_s = buffer_s[-(self.stack-1):] if self.stack > 1 else []
                     buffer_a, buffer_r = [], []
+                    buffer_idx = -1
                     self.AC.pull_global()
 
                 s = s_
                 total_step += 1
+                buffer_idx += 1
                 if done:
                     GLOBAL_R.append(ep_r)
                     if len(GLOBAL_RUNNING_R) == 0:  # record running episode reward
@@ -790,12 +787,6 @@ class Worker(object):
                     print(self.name, '\tep: ', GLOBAL_EP, '\tep_r_av: ', GLOBAL_RUNNING_R[-1], '\tep_r: ', ep_r, end='')
                     for name, update_output in update_outputs.items():
                         print('\t', name, ': ', update_output, end='')
-                    '''
-                    if FORWARD_PREDICT:
-                        print('\tforward prediction loss: ', update_outputs['forward_predict'], end='')
-                    if RECONSTRUCT:
-                        print('\treconstruction loss: ', update_outputs['reconstruct'], end='')
-                    '''
                     print('')
                     '''
                     log_lock.acquire()
@@ -1063,7 +1054,7 @@ def run_tests(n_tests, randomize_start=False, start_state=np.array([np.pi, 0])):
     if 'reconstruct' in TASKS:
         reconstructions, buffer_s_ = GLOBAL_AC.reconstruct(buffer_s)
 
-        print('Mean reconstruction error: ',np.mean( buffer_s_ - reconstructions))
+        print('Mean reconstruction error: ',np.mean( buffer_s - reconstructions))
 
         if IMAGE_SHAPE is not None:
             plt.imshow(np.squeeze(reconstructions[0]))
