@@ -729,8 +729,8 @@ class Worker(object):
                             v_s_ = 0   # terminal
                         else:
                             obs_hist = buffer_s[-self.stack:]
-                            feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
-                            v_s_ = SESS.run(self.AC.outputs['critic'], feed_dict=feed_dict)[0, 0]
+                            obs_feed_dict = {var: obs[np.newaxis, :] for var, obs in zip(self.AC.s, obs_hist)}
+                            v_s_ = SESS.run(self.AC.outputs['critic'], feed_dict=obs_feed_dict)[0, 0]
 
                         buffer_v_target = []
                         for r in buffer_r[::-1]:    # reverse buffer r
@@ -739,15 +739,15 @@ class Worker(object):
                         buffer_v_target.reverse()
 
                         buffer_v_target = np.vstack(buffer_v_target)
-
                         feed_dict[self.AC.v_target] = buffer_v_target
 
                     if 'actor' in TASKS:
                         if CONTINUOUS:
-                            buffer_a = np.vstack(buffer_a)
+                            buffer_a_ = np.vstack(buffer_a)
                         else:
-                            buffer_a = np.array(buffer_a)
-                        feed_dict[self.AC.a_his] = buffer_a
+                            buffer_a_ = np.array(buffer_a)
+                        feed_dict[self.AC.a_his] = buffer_a_
+
                     '''
                     print(len(buffer_s))
                     print(len(buffer_a))
@@ -763,6 +763,7 @@ class Worker(object):
 
                     import ipdb; ipdb.set_trace()
                     '''
+
                     if self.debug and self.name == 'W_0':
                         a_loss, c_loss, t_td, c_loss, t_log_prob, t_exp_v, t_entropy, t_exp_v2, a_loss, a_grads, c_grads = self.AC.get_stats(feed_dict)
                         #print("a_loss: ", a_loss.shape, " ", a_loss, "\tc_loss: ", c_loss.shape, " ", c_loss, "\ttd: ", t_td.shape, " ", t_td, "\tlog_prob: ", t_log_prob.shape, " ", t_log_prob, "\texp_v: ", t_exp_v.shape, " ", t_exp_v, "\tentropy: ", t_entropy.shape, " ", t_entropy, "\texp_v2: ", t_exp_v2.shape, " ", t_exp_v2, "\ta_grads: ", [np.sum(weights) for weights in a_grads], "\tc_grads: ", [np.sum(weights) for weights in c_grads])
